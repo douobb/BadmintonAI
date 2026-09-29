@@ -1,0 +1,63 @@
+{
+  "mapping_name": "BadmintonAI 羽球場區代碼",
+  "mapping_version": "1.0.0",
+  "compiled_on": "2026-09-24",
+  "sources": [
+    {
+      "repository": "BadmintonAI_v2",
+      "path": "docs/private/DATA_CONTRACT.md",
+      "source_version": "v2 contractual baseline",
+      "used_for": ["正式場區代碼 1–32", "33 未定義落點 sentinel"]
+    },
+    {
+      "repository": "BadmintonAI",
+      "path": "data/metadata/court_place.txt",
+      "source_version": "來源檔未標示",
+      "used_for": ["場內網格列欄配置", "前中後場及出界區分類"]
+    }
+  ],
+  "zones": [
+    {"code": 1, "is_official_code": true, "region": "場內", "category": "後場", "court_row": 1, "court_column": "A", "position": "左側"},
+    {"code": 2, "is_official_code": true, "region": "場內", "category": "後場", "court_row": 1, "court_column": "B", "position": "中左"},
+    {"code": 3, "is_official_code": true, "region": "場內", "category": "後場", "court_row": 1, "court_column": "C", "position": "中右"},
+    {"code": 4, "is_official_code": true, "region": "場內", "category": "後場", "court_row": 1, "court_column": "D", "position": "右側"},
+    {"code": 5, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 2, "court_column": "A", "position": "左側"},
+    {"code": 6, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 2, "court_column": "B", "position": "中左"},
+    {"code": 7, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 2, "court_column": "C", "position": "中右"},
+    {"code": 8, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 2, "court_column": "D", "position": "右側"},
+    {"code": 9, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 3, "court_column": "A", "position": "左側"},
+    {"code": 10, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 3, "court_column": "B", "position": "中左"},
+    {"code": 11, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 3, "court_column": "C", "position": "中右"},
+    {"code": 12, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 3, "court_column": "D", "position": "右側"},
+    {"code": 13, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 4, "court_column": "A", "position": "左側"},
+    {"code": 14, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 4, "court_column": "B", "position": "中左"},
+    {"code": 15, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 4, "court_column": "C", "position": "中右"},
+    {"code": 16, "is_official_code": true, "region": "場內", "category": "中場", "court_row": 4, "court_column": "D", "position": "右側"},
+    {"code": 17, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 5, "court_column": "A", "position": "左側"},
+    {"code": 18, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 5, "court_column": "B", "position": "中左"},
+    {"code": 19, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 5, "court_column": "C", "position": "中右"},
+    {"code": 20, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 5, "court_column": "D", "position": "右側"},
+    {"code": 21, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 6, "court_column": "A", "position": "左側"},
+    {"code": 22, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 6, "court_column": "B", "position": "中左"},
+    {"code": 23, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 6, "court_column": "C", "position": "中右"},
+    {"code": 24, "is_official_code": true, "region": "場內", "category": "前場", "court_row": 6, "court_column": "D", "position": "右側"},
+    {"code": 25, "is_official_code": true, "region": "出界區", "category": "右側邊線出界", "court_row": null, "court_column": null, "position": "頂端"},
+    {"code": 26, "is_official_code": true, "region": "出界區", "category": "右側邊線出界", "court_row": null, "court_column": null, "position": "中段"},
+    {"code": 27, "is_official_code": true, "region": "出界區", "category": "右側邊線出界", "court_row": null, "court_column": null, "position": "底端"},
+    {"code": 28, "is_official_code": true, "region": "出界區", "category": "後方出界", "court_row": null, "court_column": null, "position": "右後方"},
+    {"code": 29, "is_official_code": true, "region": "出界區", "category": "左側邊線出界", "court_row": null, "court_column": null, "position": "頂端"},
+    {"code": 30, "is_official_code": true, "region": "出界區", "category": "左側邊線出界", "court_row": null, "court_column": null, "position": "中段"},
+    {"code": 31, "is_official_code": true, "region": "出界區", "category": "左側邊線出界", "court_row": null, "court_column": null, "position": "底端"},
+    {"code": 32, "is_official_code": true, "region": "出界區", "category": "後方出界", "court_row": null, "court_column": null, "position": "左後方"}
+  ],
+  "landing_area_sentinel": {
+    "code": 33,
+    "is_official_code": false,
+    "is_out_of_bounds": false,
+    "region": "非正式區域",
+    "category": "未定義落點",
+    "court_row": null,
+    "court_column": null,
+    "position": "無正式網格位置"
+  }
+}

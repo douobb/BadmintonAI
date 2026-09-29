@@ -1,0 +1,325 @@
+{
+  "snapshot": {
+    "file": "processed_new_3.csv",
+    "sha256": "949ca54eeb22889604b74f1d61e8fa073f07fb9c5f5eaeaf45672fef4bd2f92f",
+    "row_count": 5191,
+    "rally_count": 409
+  },
+  "cases": {
+    "Q1": {
+      "shot_type": "殺球",
+      "numerator": 61,
+      "denominator": 192,
+      "percentage": 31.77,
+      "active_scoring_denominator": 85,
+      "active_scoring_percentage": 71.76,
+      "definition": "「佔周天成總得分」分母包含對手失誤送分；另列「在周天成主動得分中比例」"
+    },
+    "Q3": {
+      "sample_events": 299,
+      "landing_area": {
+        "valid_zones": {
+          "1": 3,
+          "4": 2,
+          "5": 20,
+          "6": 1,
+          "7": 5,
+          "8": 17,
+          "9": 49,
+          "10": 32,
+          "11": 55,
+          "12": 60,
+          "13": 10,
+          "14": 3,
+          "15": 8,
+          "16": 11,
+          "18": 1,
+          "19": 2,
+          "21": 1,
+          "22": 1,
+          "23": 2,
+          "26": 8,
+          "27": 1,
+          "30": 6,
+          "31": 1
+        },
+        "undefined_landing_sentinel_33": 0,
+        "missing": 0,
+        "invalid": 0
+      }
+    },
+    "Q5": {
+      "mapping_source": ".runtime/approved-data/metadata/court_place.txt",
+      "ambiguity_note": "自然題可解讀為周天成贏下回合的終局落點，或本人直接擊出得分的終局落點。",
+      "accepted_interpretations": {
+        "zhou_winning_rallies_terminal_event": {
+          "sample_events": 192,
+          "landing_area": {
+            "valid_zones": {
+              "1": 5,
+              "3": 2,
+              "4": 10,
+              "5": 16,
+              "6": 1,
+              "7": 2,
+              "8": 14,
+              "9": 10,
+              "11": 2,
+              "12": 14,
+              "13": 4,
+              "16": 3,
+              "19": 1,
+              "20": 4,
+              "21": 19,
+              "22": 5,
+              "23": 10,
+              "24": 9,
+              "25": 4,
+              "26": 8,
+              "27": 4,
+              "28": 13,
+              "29": 4,
+              "30": 10,
+              "31": 4,
+              "32": 12
+            },
+            "undefined_landing_sentinel_33": 2,
+            "missing": 0,
+            "invalid": 0
+          },
+          "definition": "周天成贏下的每個回合之終局事件落點"
+        },
+        "zhou_direct_winning_stroke": {
+          "sample_events": 85,
+          "landing_area": {
+            "valid_zones": {
+              "1": 5,
+              "3": 1,
+              "4": 8,
+              "5": 16,
+              "6": 1,
+              "7": 2,
+              "8": 12,
+              "9": 10,
+              "11": 2,
+              "12": 14,
+              "13": 4,
+              "16": 3,
+              "20": 3,
+              "21": 1,
+              "24": 2,
+              "30": 1
+            },
+            "undefined_landing_sentinel_33": 0,
+            "missing": 0,
+            "invalid": 0
+          },
+          "definition": "僅計周天成本人擊出且得分的終局事件落點"
+        }
+      }
+    },
+    "Q7": {
+      "sample_events": 299,
+      "player_location_area": {
+        "valid_zones": {
+          "2": 2,
+          "6": 7,
+          "7": 7,
+          "10": 82,
+          "11": 34,
+          "13": 1,
+          "14": 87,
+          "15": 39,
+          "17": 2,
+          "18": 20,
+          "19": 17,
+          "20": 1
+        },
+        "undefined_landing_sentinel_33": 0,
+        "missing": 0,
+        "invalid": 0
+      },
+      "player_location_xy": {
+        "valid_coordinate_events": 299,
+        "distinct_locations": 299,
+        "x_range": [-0.4573198496286895, 0.4340106356254787],
+        "y_range": [-0.22577178507414, 0.6891949273767622],
+        "coordinate_multiset_sha256": "194e57c13824ad68f5fb8e371643f667c6c30649d6ed044eb7bdd06c36222f59",
+        "excluded_unusable_coordinates": 0,
+        "source_fields": ["player_location_x", "player_location_y"]
+      }
+    },
+    "Q8": {
+      "sample_events": 135,
+      "top_three": [
+        {
+          "shot_type": "網前球",
+          "count": 53
+        },
+        {
+          "shot_type": "推撲球",
+          "count": 33
+        },
+        {
+          "shot_type": "挑球",
+          "count": 24
+        }
+      ],
+      "court_zones": [
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    "Q25": {
+      "sample_events": 62,
+      "mapping_source": ".runtime/approved-data/metadata/court_place.txt, Spatial Relationships matrix: Col A and Col D",
+      "left_side_zones": [
+        1,
+        5,
+        9,
+        13,
+        17,
+        21
+      ],
+      "right_side_zones": [
+        4,
+        8,
+        12,
+        16,
+        20,
+        24
+      ],
+      "side_zones": [
+        1,
+        4,
+        5,
+        8,
+        9,
+        12,
+        13,
+        16,
+        17,
+        20,
+        21,
+        24
+      ],
+      "landing_area_counts": {
+        "1": 2,
+        "4": 1,
+        "6": 1,
+        "9": 3,
+        "10": 1,
+        "11": 1,
+        "13": 6,
+        "14": 6,
+        "15": 3,
+        "16": 2,
+        "17": 4,
+        "18": 5,
+        "19": 4,
+        "20": 6,
+        "21": 1,
+        "22": 2,
+        "23": 2,
+        "24": 5,
+        "25": 2,
+        "27": 2,
+        "30": 1
+      },
+      "undefined_landing_sentinel_33": 2
+    },
+    "Q32": {
+      "long_rallies_at_least_10_events": 223,
+      "zhou_wins": 103,
+      "numerator": 103,
+      "denominator": 223,
+      "percentage": 46.19,
+      "definition": "以 rally_id 分組；至少 10 拍，終局得分者為周天成"
+    },
+    "Q60": {
+      "eligible_losing_rallies": 62,
+      "top_shot_type": "長球",
+      "top_count": 17,
+      "percentage": 27.42,
+      "counts": {
+        "切球": 6,
+        "平球": 2,
+        "挑球": 7,
+        "接殺防守": 5,
+        "推撲球": 6,
+        "殺球": 2,
+        "發長球": 3,
+        "網前球": 14,
+        "長球": 17
+      },
+      "definition": "周天成失分回合的整體倒數第二拍，僅納入該拍由周天成擊出的回合"
+    },
+    "FOLLOWUP": {
+      "殺球": {
+        "shot_type": "殺球",
+        "numerator": 61,
+        "denominator": 192,
+        "percentage": 31.77,
+        "active_scoring_denominator": 85,
+        "active_scoring_percentage": 71.76,
+        "definition": "「佔周天成總得分」分母包含對手失誤送分；另列「在周天成主動得分中比例」"
+      },
+      "切球": {
+        "shot_type": "切球",
+        "numerator": 2,
+        "denominator": 192,
+        "percentage": 1.04,
+        "active_scoring_denominator": 85,
+        "active_scoring_percentage": 2.35,
+        "definition": "「佔周天成總得分」分母包含對手失誤送分；另列「在周天成主動得分中比例」"
+      },
+      "平球": {
+        "shot_type": "平球",
+        "numerator": 2,
+        "denominator": 192,
+        "percentage": 1.04,
+        "active_scoring_denominator": 85,
+        "active_scoring_percentage": 2.35,
+        "definition": "「佔周天成總得分」分母包含對手失誤送分；另列「在周天成主動得分中比例」"
+      },
+      "挑球": {
+        "shot_type": "挑球",
+        "numerator": 0,
+        "denominator": 192,
+        "percentage": 0.0,
+        "active_scoring_denominator": 85,
+        "active_scoring_percentage": 0.0,
+        "definition": "「佔周天成總得分」分母包含對手失誤送分；另列「在周天成主動得分中比例」"
+      }
+    },
+    "NO_DATA": {
+      "searched_player": "不存在球員測試",
+      "matching_rows": 0,
+      "available_players": [
+        "CHOU Tien Chen",
+        "Kento MOMOTA"
+      ],
+      "expected_behavior": "明確回覆沒有資料，不推測數字"
+    }
+  },
+  "behavior_cases": {
+    "AMBIGUOUS": {
+      "behavior": "若代名詞或省略指稱可能對應多個候選對象且會改變結果，先向使用者澄清；確認前可查資料目錄或知識以釐清，但不可執行分析工具。",
+      "must_not": [
+        "自行猜選候選對象",
+        "為各候選對象預先試算並回報結果",
+        "在澄清前回報單一對象的分析結果"
+      ]
+    },
+    "ERROR_502": {
+      "behavior": "說明分析服務暫時不可用並停止本訊息的分析重試。",
+      "max_analysis_retries_after_502": 0,
+      "must_not": [
+        "將 502 當作可修正程式錯誤重試",
+        "猜測數值"
+      ]
+    }
+  }
+}

@@ -1,0 +1,166 @@
+name: badminton-ai-v2
+
+services:
+  tool-server:
+    image: badminton-ai-tool-server:0.1.0
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${BADMINTON_AI_TOOL_SERVER_HOST_PORT:-8000}:8000"
+    environment:
+      BADMINTON_AI_APP_ENV: "${BADMINTON_AI_APP_ENV:-development}"
+      BADMINTON_AI_SOURCE_DATA_DIR: /var/lib/badminton-ai/source
+      BADMINTON_AI_DATA_FILE: "${BADMINTON_AI_DATA_FILE:?BADMINTON_AI_DATA_FILE 必須指向 source data 內的檔案}"
+      BADMINTON_AI_METADATA_DIR: "${BADMINTON_AI_METADATA_DIR:-metadata}"
+      BADMINTON_AI_SQLITE_TABLE: "${BADMINTON_AI_SQLITE_TABLE:-match_data}"
+      BADMINTON_AI_HOST: 0.0.0.0
+      BADMINTON_AI_PORT: "8000"
+      BADMINTON_AI_OPEN_WEBUI_URL: http://open-webui:8080
+      BADMINTON_AI_OPEN_WEBUI_API_KEY: "${BADMINTON_AI_OPEN_WEBUI_API_KEY:-}"
+      BADMINTON_AI_PLOTLY_ASSET_URL: "http://127.0.0.1:${BADMINTON_AI_TOOL_SERVER_HOST_PORT:-8000}/assets/plotly-6.6.0.min.js"
+    volumes:
+      - type: bind
+        source: "${BADMINTON_AI_SOURCE_DATA_HOST_DIR:?BADMINTON_AI_SOURCE_DATA_HOST_DIR 必須指向已準備的資料目錄}"
+        target: /var/lib/badminton-ai/source
+        read_only: true
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+    networks:
+      - badminton
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, urllib.request;
+          data = json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5));
+          raise SystemExit(0 if data.get('status') == 'ok' else 1)
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 15s
+
+  open-webui:
+    image: badminton-ai-open-webui:0.11.3-safe-errors
+    build:
+      context: .
+      dockerfile: openwebui_patch/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      tool-server:
+        condition: service_healthy
+    ports:
+      - "${OPEN_WEBUI_HOST_PORT:-3000}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open_webui_data:/app/backend/data
+      - evaluation_data:/var/lib/badminton-ai/evaluation
+      - type: bind
+        source: ./scripts/__init__.py
+        target: /opt/badmintonai-evaluation/scripts/__init__.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/evaluation_runner.py
+        target: /opt/badmintonai-evaluation/scripts/evaluation_runner.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/evaluation_openwebui_client.py
+        target: /opt/badmintonai-evaluation/scripts/evaluation_openwebui_client.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/evaluation_workbench_service.py
+        target: /opt/badmintonai-evaluation/scripts/evaluation_workbench_service.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/evaluation_report_html.py
+        target: /opt/badmintonai-evaluation/scripts/evaluation_report_html.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/export_chat_html.py
+        target: /opt/badmintonai-evaluation/scripts/export_chat_html.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./src/badminton_ai/server/plotly_rich.py
+        target: /opt/badmintonai-evaluation/src/badminton_ai/server/plotly_rich.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./src/badminton_ai/server/chart_display.py
+        target: /opt/badmintonai-evaluation/src/badminton_ai/server/chart_display.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./openwebui_functions/evaluation_workbench.css
+        target: /opt/badmintonai-evaluation/ui/evaluation_workbench.css
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./openwebui_functions/evaluation_workbench.js
+        target: /opt/badmintonai-evaluation/ui/evaluation_workbench.js
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${BADMINTON_AI_EVALUATION_QUESTIONS_HOST_FILE:?BADMINTON_AI_EVALUATION_QUESTIONS_HOST_FILE 必須指向核准的唯讀 v2 評測題檔}"
+        target: /opt/badmintonai-evaluation/questions/評估問題_v2.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - badminton
+    secrets:
+      - source: webui_secret_key
+        target: webui_secret_key
+    environment:
+      WEBUI_SECRET_KEY_FILE: /run/secrets/webui_secret_key
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "16"
+      BADMINTON_AI_OPEN_WEBUI_API_KEY: "${BADMINTON_AI_OPEN_WEBUI_API_KEY:-}"
+      BADMINTON_AI_EVALUATION_STORAGE_DIR: /var/lib/badminton-ai/evaluation
+      BADMINTON_AI_EVALUATION_MODEL_ID: badmintonai
+      BADMINTON_AI_EVALUATION_TOOL_SERVER_URL: http://tool-server:8000
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --silent --show-error --fail --max-time 5
+          http://localhost:8080/health >/dev/null
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  open_webui_data:
+    name: badminton-ai-v2-open-webui-data
+  evaluation_data:
+    name: badminton-ai-v2-evaluation-data
+
+networks:
+  badminton:
+    name: badminton-ai-v2-network
+    driver: bridge
+
+secrets:
+  webui_secret_key:
+    name: badminton-ai-v2-webui-secret-key
+    file: "${WEBUI_SECRET_KEY_FILE:?WEBUI_SECRET_KEY_FILE 必須指向未納入版本控制的持久秘密檔案}"

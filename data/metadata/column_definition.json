@@ -1,0 +1,372 @@
+{
+  "metadata": {
+    "description": "羽球比賽數據欄位定義",
+    "structure": "這份數據集是**「每一拍 (Stroke-level) 的詳細紀錄表」。請將它想像成一個事件串流 (Event Stream)**，每一列 (Row) 代表場上發生了一次「擊球」。比賽階層: `match_id` -> `set` -> `rally` -> `ball_round`，謹慎考慮上層邏輯。getpoint_player、lose_reason、win_reason只在每回合終局事件有意義；來源以空字串 \"\"（不是 JSON null）表示非終局事件或不適用。"
+  },
+  "shot_types": {
+    "1": "發短球",
+    "2": "發長球",
+    "3": "長球",
+    "4": "殺球",
+    "5": "切球",
+    "6": "挑球",
+    "7": "平球",
+    "8": "網前球",
+    "9": "推撲球",
+    "10": "接殺防守",
+    "11": "接不到"
+  },
+  "data_columns": [
+    {
+      "column": "match_id",
+      "description": "比賽 ID。用來區分不同的比賽場次。",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "set",
+      "description": "局數。每場刷新。",
+      "value_range": "1-3",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "rally",
+      "description": "從發球開始到死球結束稱為一個 Rally。這是該局的第幾個 Rally。每局刷新。",
+      "usage": "跨局需配match_id, set。總回合: df.groupby(['match_id', 'set', 'rally']).ngroups",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "rally_id",
+      "description": "整個數據集中唯一的回合 ID",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "ball_round",
+      "description": "這是一個 Rally 中的第幾拍。發球是第 1 拍，接發球是第 2 拍，以此類推。",
+      "usage": "若要觀察對手回球、輸球原因等，可使用df['其他特定欄位'].shift()獲取前後拍的資訊",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "player",
+      "description": "擊球球員姓名",
+      "note": "每個rally中雙方交替擊球",
+      "usage": "與多數欄位同時使用，代表player的各種情況。例如:(df['player']=='Player A' & df['type']=='殺球') -> Player A的殺球",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "opponent",
+      "description": "對手球員姓名",
+      "note": "每個rally中雙方交替擊球",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "server",
+      "description": "是否為發球狀態",
+      "mapping": "1:player發球, 2:對打中",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "type",
+      "description": "該球player打出的球種名稱(中文)，非接到的球種",
+      "note": "參照shot_types。發球球種:發短球/發長球；大部分指的球種是扣掉發球球種保留[長球、殺球、切球、挑球、平球、網前球、推撲球、接殺防守、接不到]，依題目篩選兩者",
+      "usage": "可使用df['type'].shift()獲取前後拍的球種",
+      "group": [
+        "shot_type"
+      ]
+    },
+    {
+      "column": "player_type",
+      "description": "該球player打出的球種代碼，等價於df['opponent_type'].shift(-1)。與type欄位對應，用df['type']為佳",
+      "data_type": "float",
+      "mapping": "1-11 (見shot_types)，1、2為發球球種代碼，或0(未意義:出現在rally第一球與最後一球)，一般定義球種不包含發球球種",
+      "usage": "若需要對手如何回擊player，參考下一筆的player_type，但必須確保在同個rally中",
+      "group": [
+        "shot_type"
+      ]
+    },
+    {
+      "column": "opponent_type",
+      "description": "opponent前一球打出的球種代碼，等價於df['player_type'].shift(1)。與df['type'].shift(1)欄位對應，用df['type'].shift(1)為佳",
+      "mapping": "1-11 (見shot_types)，或0(未意義:出現在rally第一球與最後一球)，一般定義球種不包含發球球種",
+      "note": "不等價於opponent的回擊球種代碼",
+      "group": [
+        "shot_type"
+      ]
+    },
+    {
+      "column": "hit_x",
+      "description": "player擊球點X座標",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "hit_y",
+      "description": "player擊球點Y座標",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "hit_area",
+      "description": "player擊球點所在區域代碼 (1-32)，等價於df['landing_area'].shift(1)",
+      "keyword": "擊球點, hit point, hit area",
+      "note": "此欄位代表「球」被擊打瞬間的實體位置。如果題目詢問「在某區擊球」(例如：在後場擊球)，代表詢問的是球的位置，必須使用此欄位 (hit_area) 以取得合理的球種。",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "landing_x",
+      "description": "球的落點X座標，可視為下顆球對方的擊球點X座標",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "landing_y",
+      "description": "球的落點Y座標，可視為下顆球對方的擊球點Y座標",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "landing_area",
+      "description": "球的落點區域代碼 (1-32)；33 僅表示未定義落點 sentinel，不屬於正式場區。",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "player_location_x",
+      "description": "球員所站點的 X 座標。",
+      "group": [
+        "player_location"
+      ]
+    },
+    {
+      "column": "player_location_y",
+      "description": "球員所站點的 Y 座標。",
+      "group": [
+        "player_location"
+      ]
+    },
+    {
+      "column": "player_location_area",
+      "description": "當前打擊者所站點的區域代碼，df['player_location_area'] == df.groupby(['match_id', 'set', 'rally'])['opponent_location_area'].shift(1)",
+      "keyword": "站位, stance, position",
+      "note": "記錄的是對手擊球瞬間，該球員的「準備站位」或「防守回位」。",
+      "group": [
+        "player_location"
+      ]
+    },
+    {
+      "column": "player_move_x",
+      "description": "擊球點到移動位置的X座標位移量。(moving_x-hit_x)",
+      "keyword": "移動距離, 跑動距離, movement distance",
+      "note": "適用於計算球員的「移動距離」或「跑動距離」時。",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "player_move_y",
+      "description": "擊球點到移動位置的Y座標位移量。(moving_y-hit_y)",
+      "keyword": "移動距離, 跑動距離, movement distance",
+      "note": "適用於計算球員的「移動距離」或「跑動距離」時。",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "moving_x",
+      "description": "球員擊完這一球後，移動到的X座標。",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "moving_y",
+      "description": "球員擊完這一球後，移動到的Y座標。",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "player_moving_area",
+      "description": "球員擊完這一球後，移動到的區域代碼",
+      "keyword": "回位",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "opponent_location_x",
+      "description": "對手所站的位置X座標",
+      "group": [
+        "player_location"
+      ]
+    },
+    {
+      "column": "opponent_location_y",
+      "description": "對手所站的位置Y座標",
+      "group": [
+        "player_location"
+      ]
+    },
+    {
+      "column": "opponent_location_area",
+      "description": "當前對手所站的位置區域代碼，等價於df['opponent_location_area'] == df.groupby(['match_id', 'set', 'rally'])['player_location_area'].shift(-1)",
+      "group": [
+        "player_location"
+      ]
+    },
+    {
+      "column": "opponent_move_x",
+      "description": "對手擊球點到移動位置的X座標位移量。",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "opponent_move_y",
+      "description": "對手擊球點到移動位置的Y座標位移量。",
+      "group": [
+        "player_movement"
+      ]
+    },
+    {
+      "column": "ball_distance",
+      "description": "飛行距離。球從擊球點 (hit) 到落點 (landing) 的直線距離。",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "player_score",
+      "description": "當前列視角下，player 在此拍發生時所對應的當前比分。實際資料中通常會以動態欄位名稱呈現，例如 `CHOU Tien Chen_score`。",
+      "usage": "若資料中已提供 `{player_name}_score` / `{opponent_name}_score`，優先直接使用，不要自行從逐筆事件重新累積比分。",
+      "note": "這是比分欄位的通用基底定義，前端會依實際球員名稱替換成真正欄位名。",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "opponent_score",
+      "description": "當前列視角下，opponent 在此拍發生時所對應的當前比分。實際資料中通常會以動態欄位名稱呈現，例如 `Kento MOMOTA_score`。",
+      "usage": "若資料中已提供 `{player_name}_score` / `{opponent_name}_score`，優先直接使用，不要自行從逐筆事件重新累積比分。",
+      "note": "這是比分欄位的通用基底定義，前端會依實際球員名稱替換成真正欄位名。",
+      "group": [
+        "game_structure"
+      ]
+    },
+    {
+      "column": "getpoint_player",
+      "description": "僅終局事件記錄該回合得分者；非終局事件的來源值是空字串 \"\"（不是 JSON null），表示回合尚未結束，不代表任何一方得分或失分。",
+      "usage": "依回合事件順序取得終局事件的得分者；篩選已結束回合時明確排除空字串（例如 .ne('')），不要依賴 isna() 或 dropna()，也不要改寫原始 df。",
+      "note": "終局事件中得分者等於 player 表示 player 主動得分；等於 opponent 表示 player 失分。非終局的空字串不是第三種得失分結果。",
+      "IMPORTANT": "getpoint_player != CHOU Tien Chen不代表周天成失分；只有非空得分者為 Kento MOMOTA 時，才代表周天成該回合失分。分析前須排除空字串。",
+      "warning": "必要時可使用df.groupby(['match_id', 'set', 'rally'])['getpoint_player'].transform('last')",
+      "group": [
+        "scoring_reason"
+      ]
+    },
+    {
+      "column": "win_reason",
+      "description": "僅終局事件記錄 player 的得分原因；非終局事件或不適用時來源值為空字串 \"\"（不是 JSON null），不代表任何得失分。",
+      "note": "搭配ball_round查詢前後拍(e.x.回擊、造成原因)對手得分原因等",
+      "group": [
+        "scoring_reason"
+      ]
+    },
+    {
+      "column": "lose_reason",
+      "description": "僅終局事件記錄 player 的失分原因；非終局事件或不適用時來源值為空字串 \"\"（不是 JSON null），不代表任何得失分。",
+      "note": "搭配ball_round查詢前後拍(e.x.回擊、造成原因)對手失分原因等",
+      "usage": "(relevant_df['player'] == 'Player_A') & (relevant_df['lose_reason'] == '未過網') -> Player_A自己失分原因為未過網的情況",
+      "group": [
+        "scoring_reason"
+      ]
+    },
+    {
+      "column": "aroundhead",
+      "description": "是否為繞頭擊球 (1: 是, 0: 否)",
+      "group": [
+        "stroke_details"
+      ]
+    },
+    {
+      "column": "backhand",
+      "description": "是否為反手拍 (1: 是, 0: 否)",
+      "group": [
+        "stroke_details"
+      ]
+    },
+    {
+      "column": "hit_height",
+      "description": "擊球時的高度",
+      "group": [
+        "stroke_details"
+      ]
+    },
+    {
+      "column": "landing_height",
+      "description": "被接球時的高度",
+      "group": [
+        "stroke_details"
+      ]
+    },
+    {
+      "column": "landing_court_number",
+      "description": "落點所在的場地編號",
+      "group": [
+        "stroke_details"
+      ]
+    },
+    {
+      "column": "ball_distance_x",
+      "description": "球飛行路徑的 X 軸分量距離",
+      "group": [
+        "coordinates"
+      ]
+    },
+    {
+      "column": "ball_distance_y",
+      "description": "球飛行路徑的 Y 軸分量距離",
+      "group": [
+        "coordinates"
+      ]
+    }
+  ],
+  "analysis_guidelines": {
+    "rally_count": "df.groupby(['match_id', 'set', 'rally']).ngroups",
+    "winning_logic": {
+      "active": "主動得分：擊球者擊出致勝球。df['getpoint_player'] == df['player']",
+      "passive": "受迫性得分：對手失誤導致我方得分。df['getpoint_player'] == df['opponent']"
+    },
+    "win_rate": "特定選手得分率。依 ['match_id', 'set', 'rally'] 取終局得分者；僅計 getpoint_player 非空且非 JSON null 的回合，排除來源空字串 \"\"；選手勝回合數 / 有有效得分者的總回合數。",
+    "shot_success_rate": "若「成功」指該球種主動直接得分：分子僅計終局事件且 player == getpoint_player != \"\"，分母為同範圍該球種總使用次數。非終局 getpoint_player == \"\" 不代表成功，不能以 getpoint_player != opponent 代替。若要分析未直接造成失分，須另外明確定義指標，並將終局失分與回合尚未結束分開列示。",
+    "shot_analysis": {
+      "group": "用 player_type (數字代碼)",
+      "logic": "計算特定球種 T 的主動得分時，分子須為終局列 player == getpoint_player == P 且 type == T；不要把對手擊出的終局列算成 P 主動得分。",
+      "share_of_total_points": "若題目問「球種 T 得分佔 P 總得分」，分子為終局列 getpoint_player == P、player == P 且 type == T；分母為所有終局 getpoint_player == P 的回合，包含對手失誤送分。",
+      "share_within_active_points": "若題目明確問「在 P 主動得分中比例」，分母才限於終局 getpoint_player == P 且 player == P 的回合。"
+    },
+    "continuous_play": "連續回球查詢。使用 df.shift(-1) 或 df.iloc[idx + 1] 獲取下一拍資訊。"
+  }
+}

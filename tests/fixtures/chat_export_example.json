@@ -1,0 +1,24 @@
+{
+  "chat": {
+    "history": {
+      "currentId": "answer-1",
+      "messages": {
+        "question-1": {
+          "id": "question-1",
+          "parentId": null,
+          "role": "user",
+          "content": "請畫出測試資料的長條圖。"
+        },
+        "answer-1": {
+          "id": "answer-1",
+          "parentId": "question-1",
+          "role": "assistant",
+          "content": "A 有 2 筆，B 有 1 筆。",
+          "embeds": [
+            "<script id=\"plotly-figure-data\" type=\"application/json\">{\"charts\":[{\"title\":\"測試長條圖\",\"figure\":{\"data\":[{\"type\":\"bar\",\"x\":[\"A\",\"B\"],\"y\":[2,1]}],\"layout\":{}}}]}</script>"
+          ]
+        }
+      }
+    }
+  }
+}

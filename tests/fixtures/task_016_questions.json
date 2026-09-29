@@ -1,0 +1,108 @@
+[
+  {
+    "id": "Q1",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#1",
+    "categories": ["success"],
+    "turns": ["周天成使用「殺球」得分佔他總得分的百分比是多少？"],
+    "oracle_key": "Q1",
+    "acceptance_criteria": "原題「佔他總得分」的分母是周天成贏下的所有終局回合（含對手失誤送分），分子僅計入終局由周天成擊出且 type 為殺球的事件；預期 61/192=31.77%。不可用主動得分總數 85 作此題分母；只有明確問「在主動得分中比例」才另答 61/85=71.76%。"
+  },
+  {
+    "id": "Q3",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#3",
+    "categories": ["success", "chart"],
+    "turns": ["針對周天成所有「殺球」，繪製其落點熱區圖。"],
+    "oracle_key": "Q3",
+    "acceptance_criteria": "應回覆摘要並附可見的落點熱區圖；圖表計數須與 oracle 的 valid_zones 分布相符，landing_area=33 只能說明為未定義落點，不可畫成正式場區。"
+  },
+  {
+    "id": "Q5",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#5",
+    "categories": ["success", "chart", "ambiguity"],
+    "turns": ["幫我繪製周天成得分時球的落點熱區圖"],
+    "oracle_key": "Q5",
+    "acceptance_criteria": "自然語意可指周天成贏下回合的終局落點（192 筆），也可指本人直接擊出得分的終局落點（85 筆）；先澄清，或明確說明採用的解讀並依對應 oracle 作圖，不得把其中一種宣稱為唯一口徑。"
+  },
+  {
+    "id": "Q7",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#7",
+    "categories": ["success", "chart"],
+    "turns": ["繪製周天成殺球時的站點熱區圖"],
+    "oracle_key": "Q7",
+    "acceptance_criteria": "圖表以周天成殺球事件的 player_location_area 為站點，不得誤用 landing_area；附可見熱區圖。"
+  },
+  {
+    "id": "Q8",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#8",
+    "categories": ["success"],
+    "turns": ["當周天成在「後場」擊球時，他最常使用哪三種球種?"],
+    "oracle_key": "Q8",
+    "acceptance_criteria": "將後場定義為 player_location_area 1–4，列出出現次數最多的三種球種及次數。"
+  },
+  {
+    "id": "Q25",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#25",
+    "categories": ["success", "chart"],
+    "turns": ["當對手靠球場兩側時，周天成較常讓球落點到哪些區域？繪製熱區圖。"],
+    "oracle_key": "Q25",
+    "mapping_source": ".runtime/approved-data/metadata/court_place.txt (Spatial Relationships matrix)",
+    "acceptance_criteria": "依 court_place.txt 的空間矩陣，Col A 區碼 [1,5,9,13,17,21] 與 Col D 區碼 [4,8,12,16,20,24] 為兩側；以對手站位在此兩欄篩選，回報筆數與落點區域並附可見熱區圖。"
+  },
+  {
+    "id": "Q32",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#32",
+    "categories": ["success"],
+    "turns": ["在10拍以上的回合中，周天成的得分率是多少？"],
+    "oracle_key": "Q32",
+    "acceptance_criteria": "以 rally_id 分組，至少 10 筆逐拍事件為長回合；只看終局 getpoint_player，空字串不得當成失分者或有效 winner。需回報樣本數、周天成勝場數及百分比。"
+  },
+  {
+    "id": "Q60",
+    "source": "../BadmintonAI/LLM_as_a_Judge/resources/questions/評估問題_v2_natural.txt#60",
+    "categories": ["success"],
+    "turns": ["周天成失分的回合中，倒數第二拍若由他擊出，最常使用什麼球種？"],
+    "oracle_key": "Q60",
+    "acceptance_criteria": "先依 rally_id 及 ball_round 排序，選每個周天成失分回合的整體倒數第二拍，再限該拍 player 為周天成；回報樣本數與最常見球種。"
+  },
+  {
+    "id": "FOLLOWUP",
+    "source": "../Q.txt#turns-1-4",
+    "categories": ["follow_up", "success"],
+    "turns": [
+      "周天成使用「殺球」得分佔他總得分的百分比是多少？",
+      "那如果是切球呢？",
+      "那平球呢?",
+      "挑球呢?"
+    ],
+    "oracle_key": "FOLLOWUP",
+    "acceptance_criteria": "後三輪沿用周天成與「得分比例」的上下文，依序改成切球、平球、挑球；每輪分母皆為周天成總得分，不應要求使用者重述或把球種前後混用。"
+  },
+  {
+    "id": "NO_DATA",
+    "source": "TASK-016 新增案例",
+    "categories": ["no_data"],
+    "turns": ["查詢「不存在球員測試」在資料中的比賽場次與得分率；若資料內無此人，請明確告知沒有資料，不要推測。"],
+    "oracle_key": "NO_DATA",
+    "acceptance_criteria": "明確指出此名稱無對應資料，不編造場次、比分或百分比。"
+  },
+  {
+    "id": "AMBIGUOUS",
+    "source": "TASK-016 新增多輪案例",
+    "categories": ["ambiguity", "follow_up"],
+    "turns": [
+      "請比較周天成與桃田賢斗的殺球使用與直接得分表現。",
+      "那他在長回合中的得分率是多少？"
+    ],
+    "oracle_key": "AMBIGUOUS",
+    "acceptance_criteria": "後續訊息若含可能指向多個候選對象的代名詞或省略指稱，先向使用者澄清；確認前可查資料目錄或知識以釐清，但不可執行分析工具，也不可先替各候選對象試算。"
+  },
+  {
+    "id": "ERROR_502",
+    "source": "TASK-016 新增受控錯誤案例",
+    "categories": ["tool_error"],
+    "turns": ["在10拍以上的回合中，周天成的得分率是多少？"],
+    "setup": "於隔離驗收環境讓本次 runPythonAnalysis 回傳 HTTP 502；不停止服務、不呼叫外部模型 API。",
+    "oracle_key": "ERROR_502",
+    "acceptance_criteria": "確認 502 後不再呼叫 runPythonAnalysis，並據實回覆尚無分析結果。"
+  }
+]

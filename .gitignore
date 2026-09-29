@@ -1,0 +1,42 @@
+TODO.md
+docs/PRD.md
+docs/private/
+
+# Python 快取與編譯產物
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 虛擬環境
+.venv/
+venv/
+env/
+ENV/
+
+# 環境設定與本機秘密（保留非秘密範例）
+.env
+.env.*
+!.env.example
+.secrets/
+secrets/
+.webui_secret_key
+*.secret
+
+# 套件建置產物
+build/
+dist/
+*.egg-info/
+
+# 應用程式 runtime 產物
+.runtime/
+runtime/
+
+# 本機聊天匯出與暫存資料
+/output/
+/tmp/

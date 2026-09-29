@@ -1,0 +1,19 @@
+# Local datasets and evaluation files are mounted at runtime, not included in image builds.
+data/
+evaluation/
+.git
+.env
+.env.*
+.secrets/
+secrets/
+output/
+tmp/
+TODO.md
+docs/PRD.md
+docs/private/
+runtime/
+.runtime/
+__pycache__/
+.pytest_cache/
+.venv/
+venv/

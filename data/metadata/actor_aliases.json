@@ -1,0 +1,7 @@
+{
+  "dataset": "badminton_stroke_events_v1",
+  "actors": {
+    "CHOU Tien Chen": ["周天成", "Chou Tien Chen", "CHOU Tien Chen"],
+    "Kento MOMOTA": ["桃田賢斗", "桃田", "Kento Momota", "Kento MOMOTA"]
+  }
+}
