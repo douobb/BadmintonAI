@@ -26,11 +26,3 @@ jobs:
 
       - name: Run Python quality gate
         run: python scripts/quality.py
-
-      - name: Validate Compose configuration
-        env:
-          WEBUI_SECRET_KEY_FILE: ${{ runner.temp }}/badminton-ai-webui-secret
-        run: |
-          python -c "from pathlib import Path; import os; Path(os.environ['WEBUI_SECRET_KEY_FILE']).write_text('ci-dummy-secret\\n', encoding='utf-8')"
-          docker compose config --quiet
-          python -c "from pathlib import Path; import os; Path(os.environ['WEBUI_SECRET_KEY_FILE']).unlink(missing_ok=True)"

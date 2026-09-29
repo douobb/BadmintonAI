@@ -90,9 +90,7 @@ def test_load_metadata_validates_all_files_and_normalizes_alias(
 
 
 def test_approved_scoring_metadata_documents_empty_string_placeholders() -> None:
-    metadata_dir = (
-        Path(__file__).resolve().parents[1] / ".runtime" / "approved-data" / "metadata"
-    )
+    metadata_dir = Path(__file__).resolve().parents[1] / "data" / "metadata"
     metadata = load_metadata(metadata_dir)
     definitions = {item["column"]: item for item in metadata.column_definitions}
     column_file = json.loads(
