@@ -23,7 +23,7 @@ from ..data.errors import DataError
 from ..query import MAX_PAGE_LIMIT, BadmintonQueryService
 
 DEFAULT_SANDBOX_IMAGE = (
-    "badminton-ai-sandbox@sha256:"
+    "ghcr.io/douobb/badminton-ai-sandbox@sha256:"
     "ee9862501ceac5bf9064679b209ccb88801df753dc16fc14ecef76c386b9cc22"
 )
 DEFAULT_TIMEOUT_SECONDS = 30.0
