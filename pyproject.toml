@@ -18,12 +18,16 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "httpx>=0.27,<1",
+    "matplotlib==3.9.4",
     "numpy==2.2.1",
+    "pandas==2.2.3",
     "pytest>=8.0,<9",
 ]
 dev = [
     "httpx>=0.27,<1",
+    "matplotlib==3.9.4",
     "numpy==2.2.1",
+    "pandas==2.2.3",
     "pytest>=8.0,<9",
     "ruff==0.16.8",
 ]

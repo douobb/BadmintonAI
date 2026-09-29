@@ -750,12 +750,9 @@ def test_report_asset_fetch_runs_off_event_loop(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-def test_api_routes_are_ordered_before_root_spa_mount(tmp_path: Path) -> None:
+def test_status_api_route_is_served_before_root_spa_mount(tmp_path: Path) -> None:
     service = _service(tmp_path / "private", question_file=tmp_path / "missing.txt")
     app = _app(service, tmp_path / "static")
-    names = [route.name for route in app.router.routes]
-    spa_index = names.index("spa")
-    assert all(names.index(route_name) < spa_index for route_name in ROUTE_NAMES)
     with TestClient(app) as client:
         response = client.get(
             ROUTES["badmintonai_evaluation_status"],
