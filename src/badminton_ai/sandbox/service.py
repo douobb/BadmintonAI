@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import io
@@ -36,7 +37,10 @@ DEFAULT_MAX_OUTPUT_FILES = 16
 DEFAULT_MAX_OUTPUT_FILE_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_OUTPUT_TOTAL_BYTES = 25 * 1024 * 1024
 DEFAULT_OUTPUT_EXTENSIONS = (".csv", ".json", ".jsonl", ".png")
+MAX_STDOUT_PREVIEW_BYTES = 4 * 1024
+STDOUT_PREVIEW_FILE = ".badminton-stdout-preview"
 _JOB_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_RENDER_FILE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,127}$")
 _CONTAINER_PREFIX_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,23}$")
 _ARTIFACT_TYPES = {
@@ -51,13 +55,392 @@ _CODE_ERROR_MESSAGES = {
     "json_serialization": (
         "圖表 JSON 無法序列化；請使用 json.loads(fig.to_json()) 產生 figure 物件"
     ),
+    "assertion_failed": "Python 程式的條件檢查未通過；請核對範圍、排除條件與資料定義",
     "syntax_error": "Python 程式語法錯誤；請修正程式後重試",
     "name_error": "Python 程式使用未定義名稱；請核對變數與 import 後重試",
-    "missing_module": "Python 程式匯入了 sandbox 未安裝的套件；請改用可用的預載套件或標準函式庫",
-    "missing_key": "Python 程式使用不存在的鍵或欄位；請核對資料欄位後重試",
-    "missing_attribute": "Python 程式使用不存在的物件屬性；請核對變數與 DataFrame 欄位後重試",
+    "missing_module": "Python 程式匯入的模組未安裝於 sandbox 映像；請改用已安裝套件或標準函式庫",
+    "missing_file": "繪圖程式引用的保存檔名不存在；請核對工具列出的實際檔案名稱",
+    "missing_key": "Python 程式引用的鍵或欄位不在目前物件中；請檢查出錯物件欄位（聚合後可能與原始 df 不同）",
+    "missing_attribute": "Python 程式使用不存在的屬性；請核對屬性名稱與物件型別後重試",
+    "invalid_value": "Python 程式的值轉換或操作失敗；請核對欄位資料型別與輸入格式",
+    "type_mismatch": "Python 程式收到不相容的值型別；請核對運算兩側的型別",
     "python_exception": "Python 分析程式執行失敗；請檢查程式與輸出契約後重試",
 }
+_LEGACY_CODE_ERROR_HINTS = {"分析程式有未定義變數": "name_error"}
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+_SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_EXCEPTION_TYPES = frozenset(
+    {
+        "AttributeError",
+        "AssertionError",
+        "FileNotFoundError",
+        "KeyError",
+        "ModuleNotFoundError",
+        "NameError",
+        "SyntaxError",
+        "TypeError",
+        "ValueError",
+    }
+)
+
+
+def _analysis_static_references(code: str) -> tuple[set[str], set[str], set[str]]:
+    """取得最小 AST 對照集合；不檢查或限制分析程式的執行內容。"""
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set(), set(), set()
+    imports: set[str] = set()
+    columns: set[str] = set()
+    attributes: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module)
+        elif isinstance(node, ast.Attribute):
+            if _SAFE_IDENTIFIER.fullmatch(node.attr):
+                attributes.add(node.attr)
+        elif isinstance(node, ast.Subscript):
+            base = node.value
+            dataframe = isinstance(base, ast.Name) and base.id == "df"
+            indexer = (
+                isinstance(base, ast.Attribute)
+                and isinstance(base.value, ast.Name)
+                and base.value.id == "df"
+                and base.attr in {"loc", "iloc"}
+            )
+            if dataframe or indexer:
+                columns.update(
+                    item.value
+                    for item in ast.walk(node.slice)
+                    if isinstance(item, ast.Constant)
+                    and isinstance(item.value, str)
+                    and len(item.value) <= 128
+                )
+    return imports, columns, attributes
+
+
+def _analysis_static_references_on_line(
+    code: str, line: int | None
+) -> tuple[set[str], set[str], set[str]]:
+    """只取得錯誤行明寫的鍵、屬性與短檔名，不使用動態錯誤本文。"""
+
+    if not isinstance(line, int) or line < 1:
+        return set(), set(), set()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set(), set(), set()
+    keys: set[str] = set()
+    attributes: set[str] = set()
+    filenames: set[str] = set()
+    for node in ast.walk(tree):
+        if getattr(node, "lineno", None) != line:
+            continue
+        if isinstance(node, ast.Attribute) and _SAFE_IDENTIFIER.fullmatch(node.attr):
+            attributes.add(node.attr)
+        elif isinstance(node, ast.Subscript):
+            keys.update(
+                item.value
+                for item in ast.walk(node.slice)
+                if isinstance(item, ast.Constant)
+                and isinstance(item.value, str)
+                and len(item.value) <= 128
+            )
+        elif isinstance(node, ast.Call):
+            function = node.func
+            function_name = (
+                function.attr if isinstance(function, ast.Attribute) else None
+            )
+            owner = function.value if isinstance(function, ast.Attribute) else None
+            owner_name = owner.id if isinstance(owner, ast.Name) else None
+            if owner_name == "px" and function_name in {
+                "bar",
+                "line",
+                "scatter",
+                "heatmap",
+                "histogram",
+                "box",
+                "density_heatmap",
+            }:
+                for keyword in node.keywords:
+                    if keyword.arg not in {
+                        "x",
+                        "y",
+                        "color",
+                        "facet_row",
+                        "facet_col",
+                        "hover_name",
+                        "animation_frame",
+                        "names",
+                        "values",
+                        "path",
+                        "lat",
+                        "lon",
+                    }:
+                        continue
+                    value = keyword.value
+                    if (
+                        isinstance(value, ast.Constant)
+                        and isinstance(value.value, str)
+                        and _SAFE_IDENTIFIER.fullmatch(value.value)
+                    ):
+                        keys.add(value.value)
+            if function_name in {"groupby", "sort_values"}:
+                by_value = next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "by"),
+                    node.args[0] if node.args else None,
+                )
+                if isinstance(by_value, ast.Constant) and isinstance(
+                    by_value.value, str
+                ):
+                    candidates = [by_value.value]
+                elif isinstance(by_value, (ast.List, ast.Tuple)) and all(
+                    isinstance(item, ast.Constant) and isinstance(item.value, str)
+                    for item in by_value.elts
+                ):
+                    candidates = [item.value for item in by_value.elts]
+                else:
+                    candidates = []
+                keys.update(
+                    candidate
+                    for candidate in candidates
+                    if _SAFE_IDENTIFIER.fullmatch(candidate)
+                )
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            candidate = Path(node.value).name
+            if (
+                candidate == node.value
+                and _SAFE_FILENAME.fullmatch(candidate)
+                and Path(candidate).suffix.casefold() in {".csv", ".json", ".jsonl"}
+            ):
+                filenames.add(candidate)
+    return keys, attributes, filenames
+
+
+def _analysis_static_loaded_names_on_line(code: str, line: int | None) -> set[str]:
+    """只找錯誤行直接讀取的名稱，供 host 再驗證固定診斷。"""
+
+    if not isinstance(line, int) or line < 1:
+        return set()
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return set()
+    return {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.lineno == line
+        and _SAFE_IDENTIFIER.fullmatch(node.id)
+    }
+
+
+def _analysis_line_explicitly_raises_keyerror(code: str, line: int | None) -> bool:
+    if not isinstance(line, int) or line < 1:
+        return False
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Raise)
+        and node.lineno == line
+        and isinstance(node.exc, ast.Call)
+        and isinstance(node.exc.func, ast.Name)
+        and node.exc.func.id == "KeyError"
+        for node in ast.walk(tree)
+    )
+
+
+def _analysis_line_has_dynamic_attribute_error(code: str, line: int | None) -> bool:
+    if not isinstance(line, int) or line < 1:
+        return False
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or node.lineno != line:
+            continue
+        if (
+            isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id == "AttributeError"
+        ):
+            return True
+    return any(
+        isinstance(node, ast.Call)
+        and node.lineno == line
+        and isinstance(node.func, ast.Name)
+        and node.func.id in {"getattr", "setattr"}
+        and len(node.args) >= 2
+        and not (
+            isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _analysis_line_uses_integer_conversion(code: str, line: int | None) -> bool:
+    """只確認錯誤行是否呼叫內建 int，不讀取轉換值。"""
+
+    if not isinstance(line, int) or line < 1:
+        return False
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and node.lineno == line
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "int"
+        for node in ast.walk(tree)
+    )
+
+
+def _validate_code_diagnostic(
+    diagnostic: Mapping[str, Any],
+    *,
+    hint: str,
+    code: str,
+    columns: Sequence[str],
+    mode: str = "analysis",
+) -> dict[str, Any]:
+    """只接受可由原始 code 靜態引用證實的短診斷欄位。"""
+
+    imports, _, _ = _analysis_static_references(code)
+    validated: dict[str, Any] = {}
+    line = diagnostic.get("line")
+    source_lines = code.splitlines()
+    if (
+        isinstance(line, int)
+        and not isinstance(line, bool)
+        and 1 <= line <= len(source_lines)
+    ):
+        validated["line"] = line
+        line_keys, line_attributes, line_filenames = (
+            _analysis_static_references_on_line(code, line)
+        )
+        line_names = _analysis_static_loaded_names_on_line(code, line)
+        offset = diagnostic.get("offset")
+        if (
+            hint == "syntax_error"
+            and isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and 1 <= offset <= len(source_lines[line - 1]) + 1
+        ):
+            validated["offset"] = offset
+    else:
+        line_keys, line_attributes, line_filenames = set(), set(), set()
+        line_names = set()
+    exception_type = diagnostic.get("exception_type")
+    if exception_type in _SAFE_EXCEPTION_TYPES:
+        validated["exception_type"] = exception_type
+    if hint == "missing_module":
+        module = diagnostic.get("module")
+        if (
+            isinstance(module, str)
+            and len(module) <= 80
+            and all(_SAFE_IDENTIFIER.fullmatch(part) for part in module.split("."))
+            and any(item == module or item.startswith(module + ".") for item in imports)
+        ):
+            validated["module"] = module
+    elif hint == "name_error":
+        if (
+            mode == "analysis"
+            and diagnostic.get("name") == "results_dir"
+            and "results_dir" in line_names
+        ):
+            validated["name"] = "results_dir"
+            validated["stateless_results_dir"] = True
+    elif hint == "missing_key":
+        key = diagnostic.get("key")
+        accepted_keys: set[str] = set()
+        if (
+            isinstance(key, str)
+            and _SAFE_IDENTIFIER.fullmatch(key)
+            and key in line_keys
+            and not _analysis_line_explicitly_raises_keyerror(code, line)
+        ):
+            validated["key"] = key
+            accepted_keys.add(key)
+        keys = diagnostic.get("keys")
+        if isinstance(keys, list) and not _analysis_line_explicitly_raises_keyerror(
+            code, line
+        ):
+            accepted = sorted(
+                {
+                    candidate
+                    for candidate in keys[:4]
+                    if isinstance(candidate, str)
+                    and _SAFE_IDENTIFIER.fullmatch(candidate)
+                    and candidate in line_keys
+                }
+            )
+            if accepted:
+                if len(accepted) == 1 and "key" not in validated:
+                    validated["key"] = accepted[0]
+                elif len(accepted) > 1:
+                    validated["keys"] = accepted
+                accepted_keys.update(accepted)
+        if diagnostic.get("schema_column") is True and any(
+            candidate in columns for candidate in accepted_keys
+        ):
+            validated["schema_column"] = True
+    elif hint == "missing_attribute":
+        attribute = diagnostic.get("attribute")
+        if (
+            isinstance(attribute, str)
+            and _SAFE_IDENTIFIER.fullmatch(attribute)
+            and attribute in line_attributes
+            and not _analysis_line_has_dynamic_attribute_error(code, line)
+        ):
+            validated["attribute"] = attribute
+            if diagnostic.get("schema_column") is True and attribute in columns:
+                validated["schema_column"] = True
+    elif hint in {"invalid_value", "type_mismatch"}:
+        key = diagnostic.get("key")
+        if (
+            isinstance(key, str)
+            and _SAFE_IDENTIFIER.fullmatch(key)
+            and key in line_keys
+        ):
+            validated["key"] = key
+        fields = diagnostic.get("fields")
+        if isinstance(fields, list):
+            accepted = sorted(
+                {
+                    field
+                    for field in fields[:4]
+                    if isinstance(field, str)
+                    and _SAFE_IDENTIFIER.fullmatch(field)
+                    and field in line_keys
+                }
+            )
+            if accepted:
+                validated["fields"] = accepted
+    elif hint == "missing_file":
+        filename = diagnostic.get("filename")
+        if (
+            isinstance(filename, str)
+            and _SAFE_FILENAME.fullmatch(filename)
+            and Path(filename).suffix.casefold() in {".csv", ".json", ".jsonl"}
+            and filename in line_filenames
+        ):
+            validated["filename"] = filename
+    elif hint == "assertion_failed":
+        if diagnostic.get("exception_type") == "AssertionError":
+            validated["exception_type"] = "AssertionError"
+    if hint == "invalid_value" and diagnostic.get("integer_conversion") is True:
+        if _analysis_line_uses_integer_conversion(code, line):
+            validated["integer_conversion"] = True
+    return validated
 
 
 class SandboxError(DataError):
@@ -82,6 +465,97 @@ class SandboxExecutionError(SandboxError):
 
 class SandboxCodeError(SandboxExecutionError):
     """模型提供的 Python 程式在 sandbox 中發生可修正的例外。"""
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        hint: str = "python_exception",
+        diagnostic: Mapping[str, Any] | None = None,
+        _host_validated: bool = False,
+    ) -> None:
+        if hint not in _CODE_ERROR_MESSAGES:
+            hint = "python_exception"
+        # 僅接受已知固定訊息作為相容輸入；絕不保留任意例外本文。
+        if message in _CODE_ERROR_MESSAGES.values():
+            hint = next(
+                key for key, value in _CODE_ERROR_MESSAGES.items() if value == message
+            )
+        elif message in _LEGACY_CODE_ERROR_HINTS:
+            hint = _LEGACY_CODE_ERROR_HINTS[message]
+        self.hint = hint
+        self.diagnostic = dict(diagnostic or {}) if _host_validated else {}
+        self.diagnostic_is_host_validated = _host_validated
+        super().__init__(_CODE_ERROR_MESSAGES[hint])
+
+
+def sandbox_code_error_message(exc: SandboxCodeError) -> str:
+    """建立只含固定提示與 host 已驗證識別資訊的工具錯誤本文。"""
+
+    hint = exc.hint if exc.hint in _CODE_ERROR_MESSAGES else "python_exception"
+    message = _CODE_ERROR_MESSAGES[hint]
+    diagnostic = exc.diagnostic if exc.diagnostic_is_host_validated else {}
+    if diagnostic.get("schema_column") is True:
+        message += "；請檢查出錯物件的欄位與型別；若經過合併，欄名可能帶有 _x／_y 後綴"
+    if diagnostic.get("stateless_results_dir") is True:
+        message += (
+            "；runPythonAnalysis 每次從乾淨環境執行，沒有先前變數或 results_dir。"
+            "既有保存結果只供 renderAnalysisChart 讀取；請勿為取回數字而重畫已發布圖表。"
+            "需要新分析時請使用本次 df 並保存結果。"
+        )
+    if hint == "missing_module" and isinstance(diagnostic.get("module"), str):
+        message += f"；來源程式匯入的未安裝模組：{diagnostic['module']}"
+    elif hint == "missing_key":
+        keys = diagnostic.get("keys")
+        if isinstance(keys, list):
+            safe_keys = [
+                key
+                for key in keys
+                if isinstance(key, str) and _SAFE_IDENTIFIER.fullmatch(key)
+            ][:4]
+        else:
+            key = diagnostic.get("key")
+            safe_keys = (
+                [key]
+                if isinstance(key, str) and _SAFE_IDENTIFIER.fullmatch(key)
+                else []
+            )
+        if safe_keys:
+            message += f"；來源程式靜態引用鍵：{'、'.join(safe_keys)}"
+    elif hint in {"invalid_value", "type_mismatch"} and isinstance(
+        diagnostic.get("key"), str
+    ):
+        message += f"；來源程式靜態引用鍵：{diagnostic['key']}"
+    if hint in {"invalid_value", "type_mismatch"} and isinstance(
+        diagnostic.get("fields"), list
+    ):
+        fields = [
+            field
+            for field in diagnostic["fields"]
+            if isinstance(field, str) and _SAFE_IDENTIFIER.fullmatch(field)
+        ][:4]
+        if fields:
+            message += f"；來源程式此行靜態引用欄位：{'、'.join(fields)}"
+    if hint == "invalid_value" and diagnostic.get("integer_conversion") is True:
+        message += (
+            "；若整數轉換遇到小數字串，先用 pd.to_numeric(errors='coerce')，"
+            "檢查缺值與整數性後再轉型，不要直接取整"
+        )
+    elif hint == "missing_attribute" and isinstance(diagnostic.get("attribute"), str):
+        message += f"；靜態屬性引用：{diagnostic['attribute']}"
+    elif hint == "missing_file" and isinstance(diagnostic.get("filename"), str):
+        message += f"；來源程式引用檔名：{diagnostic['filename']}"
+    exception_type = diagnostic.get("exception_type")
+    if exception_type in _SAFE_EXCEPTION_TYPES:
+        message += f"；例外類型：{exception_type}"
+    line = diagnostic.get("line")
+    if isinstance(line, int) and not isinstance(line, bool) and line > 0:
+        message += f"（分析程式第 {line} 行"
+        offset = diagnostic.get("offset")
+        if isinstance(offset, int) and not isinstance(offset, bool) and offset > 0:
+            message += f"、第 {offset} 欄"
+        message += "）"
+    return message
 
 
 class SandboxTimeoutError(SandboxError):
@@ -218,6 +692,7 @@ class MaterializationManifest:
         "manifest.json",
         "analysis.py",
     )
+    mode: str = "analysis"
 
 
 @dataclass(frozen=True)
@@ -244,6 +719,19 @@ class SandboxArtifact:
 
 
 @dataclass(frozen=True)
+class SandboxInputFile:
+    """繪圖 job 可讀的保存資料檔；不包含原始 snapshot。"""
+
+    relative_path: str
+    content: bytes
+
+    def __post_init__(self) -> None:
+        _validate_render_relative_path(self.relative_path)
+        if not isinstance(self.content, bytes):
+            raise SandboxPolicyError("繪圖輸入檔案必須是位元組")
+
+
+@dataclass(frozen=True)
 class SandboxResult:
     """成功 sandbox job 的 immutable 結果契約。"""
 
@@ -251,6 +739,8 @@ class SandboxResult:
     exit_code: int
     manifest: MaterializationManifest
     artifacts: tuple[SandboxArtifact, ...]
+    stdout_preview: str | None = None
+    stdout_preview_truncated: bool = False
 
 
 def _canonicalize_json_value(
@@ -333,6 +823,32 @@ def _snapshot_id(columns: tuple[str, ...], rows: tuple[Mapping[str, Any], ...]) 
 def _validate_job_id(job_id: str) -> None:
     if not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None:
         raise SandboxPolicyError("sandbox job id 格式不合法")
+
+
+def _validate_render_relative_path(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or "\\" in value
+        or ":" in value
+        or "\x00" in value
+    ):
+        raise SandboxPolicyError("繪圖輸入路徑不合法")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or not 1 <= len(path.parts) <= 4
+        or any(
+            component in {".", ".."}
+            or _RENDER_FILE_COMPONENT.fullmatch(component) is None
+            for component in path.parts
+        )
+        or Path(value).suffix.casefold() not in {".csv", ".json", ".jsonl"}
+    ):
+        raise SandboxPolicyError("繪圖輸入路徑不合法")
+    return value
 
 
 def _safe_source_name(source: str) -> str:
@@ -502,6 +1018,102 @@ class SnapshotMaterializer:
             )
             raise SandboxMaterializationError("snapshot input 無法安全物化") from exc
 
+    def materialize_render(
+        self,
+        files: Sequence[SandboxInputFile],
+        *,
+        snapshot_id: str,
+        job_id: str | None = None,
+    ) -> MaterializedSnapshot:
+        """只將指定的已保存 JSON/CSV 檔案物化為 render 唯讀輸入。"""
+
+        if (
+            not isinstance(snapshot_id, str)
+            or not snapshot_id
+            or len(snapshot_id) > 128
+        ):
+            raise SandboxMaterializationError("保存結果 snapshot 識別資訊無效")
+        if not isinstance(files, Sequence) or not files:
+            raise SandboxMaterializationError("繪圖至少需要一個已保存資料檔")
+        if job_id is None:
+            job_id = uuid.uuid4().hex
+        _validate_job_id(job_id)
+        seen: set[str] = set()
+        for item in files:
+            if not isinstance(item, SandboxInputFile):
+                raise SandboxMaterializationError("繪圖輸入檔案格式無效")
+            _validate_render_relative_path(item.relative_path)
+            if item.relative_path in seen:
+                raise SandboxMaterializationError("繪圖輸入檔案重複")
+            seen.add(item.relative_path)
+        try:
+            root = Path(
+                tempfile.mkdtemp(
+                    prefix=f"badminton-ai-sandbox-{job_id}-",
+                    dir=str(self._temp_dir) if self._temp_dir is not None else None,
+                )
+            ).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise SandboxMaterializationError("sandbox job 暫存目錄無法建立") from exc
+        self._owned_roots.add(root)
+        input_dir = root / "input"
+        output_dir = root / "output"
+        try:
+            input_dir.mkdir()
+            output_dir.mkdir()
+            results_dir = input_dir / "results"
+            results_dir.mkdir()
+            names: list[str] = []
+            for item in files:
+                target = results_dir.joinpath(*PurePosixPath(item.relative_path).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(item.content)
+                names.append(f"results/{item.relative_path}")
+            manifest = MaterializationManifest(
+                format_version=1,
+                source="saved-analysis",
+                columns=(),
+                row_count=0,
+                snapshot_id=snapshot_id,
+                metadata_available=False,
+                schema_available=False,
+                input_files=("results/", "manifest.json", "analysis.py", *names),
+                mode="render",
+            )
+            (input_dir / manifest.manifest_file).write_text(
+                _render_json(asdict(manifest), path="manifest", sort_keys=True),
+                encoding="utf-8",
+            )
+            return MaterializedSnapshot(
+                job_id=job_id,
+                root_dir=str(root),
+                input_dir=str(input_dir),
+                output_dir=str(output_dir),
+                manifest=manifest,
+            )
+        except DataError:
+            self.cleanup(
+                MaterializedSnapshot(
+                    job_id=job_id,
+                    root_dir=str(root),
+                    input_dir=str(input_dir),
+                    output_dir=str(output_dir),
+                    manifest=MaterializationManifest(1, "", (), 0, ""),
+                )
+            )
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.cleanup(
+                MaterializedSnapshot(
+                    job_id=job_id,
+                    root_dir=str(root),
+                    input_dir=str(input_dir),
+                    output_dir=str(output_dir),
+                    manifest=MaterializationManifest(1, "", (), 0, ""),
+                )
+            )
+            raise SandboxMaterializationError("保存結果無法安全物化") from exc
+
     def cleanup(self, materialized: MaterializedSnapshot) -> None:
         """只清理此 materializer 建立的精確 job root。"""
 
@@ -613,24 +1225,68 @@ class DockerSandboxRunner:
             raise SandboxPolicyError("sandbox runner 必須接收 SandboxJob")
         if len(job.code.encode("utf-8")) > self.policy.code_max_bytes:
             raise SandboxPolicyError("sandbox code 超過大小上限")
-
         self._check_runtime()
-        materialized: MaterializedSnapshot | None = None
+        materialized = self._materializer.materialize(
+            query_service,
+            job_id=job.job_id,
+        )
+        return self._execute_materialized(
+            materialized, job_id=job.job_id, code=job.code
+        )
+
+    def run_render(
+        self,
+        files: Sequence[SandboxInputFile],
+        *,
+        snapshot_id: str,
+        code: str,
+    ) -> SandboxResult:
+        """只讀已保存分析檔執行繪圖，不接收或查詢原始資料服務。"""
+
+        if not isinstance(code, str) or "\x00" in code:
+            raise SandboxPolicyError("sandbox code 必須是無 NUL 的文字")
+        if len(code.encode("utf-8")) > self.policy.code_max_bytes:
+            raise SandboxPolicyError("sandbox code 超過大小上限")
+        if not isinstance(files, Sequence) or not files:
+            raise SandboxPolicyError("繪圖至少需要一個已保存資料檔")
+        if len(files) > self.policy.max_output_files:
+            raise SandboxPolicyError("繪圖輸入檔案數量超過上限")
+        total_bytes = 0
+        for item in files:
+            if not isinstance(item, SandboxInputFile):
+                raise SandboxPolicyError("繪圖輸入檔案格式無效")
+            if len(item.content) > self.policy.max_output_file_bytes:
+                raise SandboxPolicyError("繪圖輸入檔案超過大小上限")
+            total_bytes += len(item.content)
+        if total_bytes > self.policy.max_output_total_bytes:
+            raise SandboxPolicyError("繪圖輸入總大小超過上限")
+        self._check_runtime()
+        job_id = uuid.uuid4().hex
+        materialized = self._materializer.materialize_render(
+            files,
+            snapshot_id=snapshot_id,
+            job_id=job_id,
+        )
+        return self._execute_materialized(materialized, job_id=job_id, code=code)
+
+    def _execute_materialized(
+        self,
+        materialized: MaterializedSnapshot,
+        *,
+        job_id: str,
+        code: str,
+    ) -> SandboxResult:
         cleanup_allowed = True
         container_created = False
         container_removed = False
         container_name = self._container_name(uuid.uuid4().hex)
         try:
-            materialized = self._materializer.materialize(
-                query_service,
-                job_id=job.job_id,
-            )
             self._validate_materialized_paths(materialized)
             code_path = (
                 Path(materialized.input_dir) / materialized.manifest.analysis_file
             )
             try:
-                code_path.write_bytes(job.code.encode("utf-8"))
+                code_path.write_bytes(code.encode("utf-8"))
                 self._prepare_mounts(materialized)
             except OSError as exc:
                 raise SandboxMaterializationError(
@@ -648,7 +1304,12 @@ class DockerSandboxRunner:
                     timeout=float(self.policy.timeout_seconds),
                 )
                 if completed.returncode == _ANALYSIS_CODE_EXIT:
-                    raise self._code_error(container_name)
+                    raise self._code_error(
+                        container_name,
+                        code=code,
+                        columns=materialized.manifest.columns,
+                        mode=materialized.manifest.mode,
+                    )
                 if completed.returncode != 0:
                     raise SandboxExecutionError("sandbox 容器執行失敗")
                 self._copy_output(container_name, Path(materialized.output_dir))
@@ -660,14 +1321,20 @@ class DockerSandboxRunner:
                     cleanup_allowed = False
                     raise
                 raise SandboxTimeoutError("sandbox 執行逾時") from exc
-            artifacts = self._collect_artifacts(Path(materialized.output_dir))
+            output_dir = Path(materialized.output_dir)
+            artifacts = self._collect_artifacts(output_dir)
+            stdout_preview, stdout_preview_truncated = self._read_stdout_preview(
+                output_dir
+            )
             self._remove_container(container_name)
             container_removed = True
             return SandboxResult(
-                job_id=job.job_id,
+                job_id=job_id,
                 exit_code=completed.returncode,
                 manifest=materialized.manifest,
                 artifacts=artifacts,
+                stdout_preview=stdout_preview,
+                stdout_preview_truncated=stdout_preview_truncated,
             )
         finally:
             if container_created and not container_removed and cleanup_allowed:
@@ -706,8 +1373,15 @@ class DockerSandboxRunner:
             timeout=timeout,
         )
 
-    def _code_error(self, container_name: str) -> SandboxCodeError:
-        """僅擷取固定診斷代碼；不將 traceback、資料或程式原文送回模型。"""
+    def _code_error(
+        self,
+        container_name: str,
+        *,
+        code: str,
+        columns: Sequence[str],
+        mode: str = "analysis",
+    ) -> SandboxCodeError:
+        """擷取短診斷後由 host 對照原始程式與 schema 再驗證。"""
 
         reader = (
             "from pathlib import Path; "
@@ -735,17 +1409,33 @@ class DockerSandboxRunner:
         except (OSError, subprocess.TimeoutExpired):
             return SandboxCodeError(_CODE_ERROR_MESSAGES["python_exception"])
         hint = "python_exception"
+        diagnostic: dict[str, Any] = {}
         if completed.returncode == 0 and isinstance(completed.stdout, str):
             try:
                 payload = json.loads(completed.stdout)
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid diagnostic envelope")
                 if (
-                    payload.get("version") == 1
+                    payload.get("version") in {1, 2}
                     and payload.get("hint") in _CODE_ERROR_MESSAGES
                 ):
                     hint = payload["hint"]
+                    raw_diagnostic = payload.get("diagnostic")
+                    if payload.get("version") == 2 and isinstance(raw_diagnostic, dict):
+                        diagnostic = _validate_code_diagnostic(
+                            raw_diagnostic,
+                            hint=hint,
+                            code=code,
+                            columns=columns,
+                            mode=mode,
+                        )
             except (TypeError, ValueError, AttributeError):
                 pass
-        return SandboxCodeError(_CODE_ERROR_MESSAGES[hint])
+        return SandboxCodeError(
+            hint=hint,
+            diagnostic=diagnostic,
+            _host_validated=True,
+        )
 
     def _create_container(self, command: Sequence[str]) -> None:
         completed = self._call(command, timeout=10.0)
@@ -868,14 +1558,27 @@ class DockerSandboxRunner:
                         raise SandboxArtifactError(
                             "sandbox artifact archive 只允許一般檔案"
                         )
-                    file_count += 1
-                    if file_count > self.policy.max_output_files:
-                        raise SandboxArtifactError("sandbox artifact 數量超過上限")
-                    if member.size > self.policy.max_output_file_bytes:
-                        raise SandboxArtifactError("sandbox 單一 artifact 超過大小上限")
-                    total_bytes += member.size
-                    if total_bytes > self.policy.max_output_total_bytes:
-                        raise SandboxArtifactError("sandbox artifact 總大小超過上限")
+                    is_stdout_preview = (
+                        pure_name.as_posix().removeprefix("./") == STDOUT_PREVIEW_FILE
+                    )
+                    if is_stdout_preview:
+                        if member.size > MAX_STDOUT_PREVIEW_BYTES + 1:
+                            raise SandboxArtifactError(
+                                "sandbox stdout preview 超過大小上限"
+                            )
+                    else:
+                        file_count += 1
+                        if file_count > self.policy.max_output_files:
+                            raise SandboxArtifactError("sandbox artifact 數量超過上限")
+                        if member.size > self.policy.max_output_file_bytes:
+                            raise SandboxArtifactError(
+                                "sandbox 單一 artifact 超過大小上限"
+                            )
+                        total_bytes += member.size
+                        if total_bytes > self.policy.max_output_total_bytes:
+                            raise SandboxArtifactError(
+                                "sandbox artifact 總大小超過上限"
+                            )
                     candidate.parent.mkdir(parents=True, exist_ok=True)
                     source = archive.extractfile(member)
                     if source is None:
@@ -908,11 +1611,27 @@ class DockerSandboxRunner:
         try:
             with tarfile.open(fileobj=buffer, mode="w") as archive:
                 for path in sorted(input_dir.iterdir(), key=lambda item: item.name):
-                    if path.is_symlink() or not path.is_file():
-                        raise SandboxMaterializationError(
-                            "sandbox input 只允許一般檔案"
-                        )
-                    archive.add(path, arcname=path.name, recursive=False)
+                    if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                        raise SandboxMaterializationError("sandbox input 路徑無效")
+                    if path.is_dir():
+                        for current, directories, files in os.walk(
+                            path,
+                            followlinks=False,
+                        ):
+                            current_path = Path(current)
+                            for name in (*directories, *files):
+                                candidate = current_path / name
+                                if candidate.is_symlink() or not (
+                                    candidate.is_file() or candidate.is_dir()
+                                ):
+                                    raise SandboxMaterializationError(
+                                        "sandbox input 不允許 symlink"
+                                    )
+                    archive.add(
+                        path,
+                        arcname=path.name,
+                        recursive=path.is_dir(),
+                    )
         except (OSError, tarfile.TarError) as exc:
             raise SandboxMaterializationError("sandbox input 無法打包") from exc
         return buffer.getvalue()
@@ -1034,6 +1753,11 @@ class DockerSandboxRunner:
         input_size = self._input_size(Path(materialized.input_dir))
         input_tmpfs_size = max(policy.tmpfs_bytes, input_size + 1024 * 1024)
         inode_limit = max(32, policy.max_output_files * 4)
+        output_tmpfs_size = policy.max_output_total_bytes + MAX_STDOUT_PREVIEW_BYTES + 1
+        max_file_size = max(
+            policy.max_output_file_bytes,
+            MAX_STDOUT_PREVIEW_BYTES + 1,
+        )
         return [
             self.docker_executable,
             "create",
@@ -1060,7 +1784,7 @@ class DockerSandboxRunner:
             "--pids-limit",
             str(policy.pids_limit),
             "--ulimit",
-            f"fsize={policy.max_output_file_bytes}:{policy.max_output_file_bytes}",
+            f"fsize={max_file_size}:{max_file_size}",
             "--tmpfs",
             (
                 "/sandbox/input:rw,noexec,nosuid,nodev,"
@@ -1070,7 +1794,7 @@ class DockerSandboxRunner:
             "--tmpfs",
             (
                 "/sandbox/output:rw,nosuid,nodev,"
-                f"size={policy.max_output_total_bytes},nr_inodes={inode_limit},"
+                f"size={output_tmpfs_size},nr_inodes={inode_limit},"
                 "uid=1000,gid=1000,mode=700"
             ),
             "--tmpfs",
@@ -1107,10 +1831,17 @@ class DockerSandboxRunner:
     def _input_size(input_dir: Path) -> int:
         total = 0
         try:
-            for path in input_dir.iterdir():
-                if path.is_symlink() or not path.is_file():
-                    raise SandboxMaterializationError("sandbox input 只允許一般檔案")
-                total += path.stat().st_size
+            for current, directories, files in os.walk(input_dir, followlinks=False):
+                current_path = Path(current)
+                for name in directories:
+                    candidate = current_path / name
+                    if candidate.is_symlink() or not candidate.is_dir():
+                        raise SandboxMaterializationError("sandbox input 路徑無效")
+                for name in files:
+                    candidate = current_path / name
+                    if candidate.is_symlink() or not candidate.is_file():
+                        raise SandboxMaterializationError("sandbox input 路徑無效")
+                    total += candidate.stat().st_size
         except (OSError, ValueError) as exc:
             raise SandboxMaterializationError("sandbox input 大小無法確認") from exc
         return total
@@ -1141,9 +1872,16 @@ class DockerSandboxRunner:
                 if candidate.is_symlink():
                     raise SandboxOutputError("sandbox artifact 不允許 symlink")
                 self._ensure_inside(root, candidate)
-            file_paths.extend(current_path / name for name in files)
+            file_paths.extend(
+                current_path / name
+                for name in files
+                if (current_path / name).relative_to(root).as_posix()
+                != STDOUT_PREVIEW_FILE
+            )
         if not file_paths:
-            raise SandboxOutputError("sandbox 必須產生至少一個 artifact")
+            preview, _ = self._read_stdout_preview(root)
+            if preview is None:
+                raise SandboxOutputError("sandbox 必須產生至少一個 artifact")
         if len(file_paths) > self.policy.max_output_files:
             raise SandboxOutputError("sandbox artifact 數量超過上限")
 
@@ -1186,6 +1924,35 @@ class DockerSandboxRunner:
                 )
             )
         return tuple(artifacts)
+
+    @staticmethod
+    def _read_stdout_preview(output_dir: Path) -> tuple[str | None, bool]:
+        """讀取 bootstrap 固定上限的內部探查輸出；它不是可保存繪圖產物。"""
+
+        path = output_dir / STDOUT_PREVIEW_FILE
+        try:
+            if not path.exists():
+                return None, False
+            if path.is_symlink() or not path.is_file():
+                raise SandboxArtifactError("sandbox stdout preview 格式無效")
+            stat = path.stat()
+            if stat.st_size < 1 or stat.st_size > MAX_STDOUT_PREVIEW_BYTES + 1:
+                raise SandboxArtifactError("sandbox stdout preview 超過大小上限")
+            payload = path.read_bytes()
+        except SandboxArtifactError:
+            raise
+        except OSError as exc:
+            raise SandboxArtifactError("sandbox stdout preview 無法讀取") from exc
+        if len(payload) != stat.st_size or payload[0] not in {0, 1}:
+            raise SandboxArtifactError("sandbox stdout preview 格式無效")
+        truncated = payload[0] == 1
+        content = payload[1:]
+        if len(content) > MAX_STDOUT_PREVIEW_BYTES:
+            raise SandboxArtifactError("sandbox stdout preview 超過大小上限")
+        preview = content.decode("utf-8", errors="ignore")
+        if not preview.strip():
+            return None, truncated
+        return preview, truncated
 
     @staticmethod
     def _ensure_inside(root: Path, candidate: Path) -> None:

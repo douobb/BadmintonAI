@@ -6,7 +6,7 @@ services:
     build:
       context: .
       dockerfile: server/Dockerfile
-    restart: unless-stopped
+    restart: always
     ports:
       - "127.0.0.1:${BADMINTON_AI_TOOL_SERVER_HOST_PORT:-8000}:8000"
     environment:
@@ -15,11 +15,13 @@ services:
       BADMINTON_AI_DATA_FILE: "${BADMINTON_AI_DATA_FILE:?BADMINTON_AI_DATA_FILE 必須指向 source data 內的檔案}"
       BADMINTON_AI_METADATA_DIR: "${BADMINTON_AI_METADATA_DIR:-metadata}"
       BADMINTON_AI_SQLITE_TABLE: "${BADMINTON_AI_SQLITE_TABLE:-match_data}"
+      BADMINTON_AI_SANDBOX_IMAGE: "${BADMINTON_AI_SANDBOX_IMAGE:-}"
+      BADMINTON_AI_ANALYSIS_RESULTS_DIR: /var/lib/badminton-ai/analysis-results
       BADMINTON_AI_HOST: 0.0.0.0
       BADMINTON_AI_PORT: "8000"
       BADMINTON_AI_OPEN_WEBUI_URL: http://open-webui:8080
       BADMINTON_AI_OPEN_WEBUI_API_KEY: "${BADMINTON_AI_OPEN_WEBUI_API_KEY:-}"
-      BADMINTON_AI_PLOTLY_ASSET_URL: "http://127.0.0.1:${BADMINTON_AI_TOOL_SERVER_HOST_PORT:-8000}/assets/plotly-6.6.0.min.js"
+      BADMINTON_AI_PLOTLY_ASSET_URL: /badmintonai/assets/plotly-6.6.0.min.js
     volumes:
       - type: bind
         source: "${BADMINTON_AI_SOURCE_DATA_HOST_DIR:?BADMINTON_AI_SOURCE_DATA_HOST_DIR 必須指向已準備的資料目錄}"
@@ -28,6 +30,7 @@ services:
       - type: bind
         source: /var/run/docker.sock
         target: /var/run/docker.sock
+      - analysis_results:/var/lib/badminton-ai/analysis-results
     networks:
       - badminton
     healthcheck:
@@ -49,7 +52,7 @@ services:
     build:
       context: .
       dockerfile: openwebui_patch/Dockerfile
-    restart: unless-stopped
+    restart: always
     depends_on:
       tool-server:
         condition: service_healthy
@@ -73,6 +76,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ./scripts/evaluation_usage.py
+        target: /opt/badmintonai-evaluation/scripts/evaluation_usage.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./scripts/evaluation_openwebui_client.py
         target: /opt/badmintonai-evaluation/scripts/evaluation_openwebui_client.py
         read_only: true
@@ -81,6 +90,12 @@ services:
       - type: bind
         source: ./scripts/evaluation_workbench_service.py
         target: /opt/badmintonai-evaluation/scripts/evaluation_workbench_service.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/html_to_pdf.py
+        target: /opt/badmintonai-evaluation/scripts/html_to_pdf.py
         read_only: true
         bind:
           create_host_path: false
@@ -134,10 +149,19 @@ services:
     environment:
       WEBUI_SECRET_KEY_FILE: /run/secrets/webui_secret_key
       CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "16"
+      # 官方 aiohttp session 設定為全域模型上游 timeout，並非單題獨立設定。
+      AIOHTTP_CLIENT_TIMEOUT: "${BADMINTON_AI_EVALUATION_UPSTREAM_TIMEOUT_SECONDS:-1200}"
+      AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT: "${BADMINTON_AI_EVALUATION_STREAM_IDLE_TIMEOUT_SECONDS:-120}"
       BADMINTON_AI_OPEN_WEBUI_API_KEY: "${BADMINTON_AI_OPEN_WEBUI_API_KEY:-}"
       BADMINTON_AI_EVALUATION_STORAGE_DIR: /var/lib/badminton-ai/evaluation
       BADMINTON_AI_EVALUATION_MODEL_ID: badmintonai
       BADMINTON_AI_EVALUATION_TOOL_SERVER_URL: http://tool-server:8000
+      BADMINTON_AI_EVALUATION_ADAPTER_WAIT_GRACE_SECONDS: "${BADMINTON_AI_EVALUATION_ADAPTER_WAIT_GRACE_SECONDS:-30}"
+      # 只套用明確列出的模型與評測回合；獨立於全域 AIOHTTP timeout。
+      BADMINTON_AI_STREAM_MODEL_IDS: "${BADMINTON_AI_STREAM_MODEL_IDS:-badmintonai}"
+      BADMINTON_AI_STREAM_TOTAL_SECONDS: "${BADMINTON_AI_STREAM_TOTAL_SECONDS:-180}"
+      BADMINTON_AI_STREAM_NO_DATA_SECONDS: "${BADMINTON_AI_STREAM_NO_DATA_SECONDS:-60}"
+      BADMINTON_AI_STREAM_NO_PROGRESS_SECONDS: "${BADMINTON_AI_STREAM_NO_PROGRESS_SECONDS:-90}"
     healthcheck:
       test:
         - CMD-SHELL
@@ -154,6 +178,8 @@ volumes:
     name: badminton-ai-v2-open-webui-data
   evaluation_data:
     name: badminton-ai-v2-evaluation-data
+  analysis_results:
+    name: badminton-ai-v2-analysis-results
 
 networks:
   badminton:

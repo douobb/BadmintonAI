@@ -7,6 +7,7 @@ import hashlib
 import json
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +17,12 @@ from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from starlette.staticfiles import StaticFiles
 
+from badminton_ai.server.plotly_rich import (
+    PLOTLY_SPEC_VERSION,
+    render_plotly_charts_html,
+    validate_plotly_charts,
+)
+from scripts.evaluation_openwebui_client import OpenWebUIStateUncertain, _turn_result
 from scripts.evaluation_runner import EvaluationRunner, TurnResult
 from scripts.evaluation_workbench_service import (
     DEFAULT_SOURCE_PATH,
@@ -27,6 +34,28 @@ from scripts.evaluation_workbench_service import (
     _state_for_ui,
     create_api_router,
 )
+
+
+def test_openwebui_adapter_wait_cap_tracks_total_timeout_plus_margin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BADMINTON_AI_OPEN_WEBUI_API_KEY", "test-only-key")
+    monkeypatch.setenv("AIOHTTP_CLIENT_TIMEOUT", "1200")
+    monkeypatch.setenv("BADMINTON_AI_EVALUATION_ADAPTER_WAIT_GRACE_SECONDS", "30")
+    monkeypatch.delenv("BADMINTON_AI_EVALUATION_ADAPTER_WAIT_SECONDS", raising=False)
+
+    client = EvaluationWorkbenchService._client_from_environment()
+
+    assert client._max_wait_seconds == 1230
+
+    monkeypatch.setenv("BADMINTON_AI_EVALUATION_ADAPTER_WAIT_GRACE_SECONDS", "90")
+    assert (
+        EvaluationWorkbenchService._client_from_environment()._max_wait_seconds == 1290
+    )
+
+    monkeypatch.setenv("BADMINTON_AI_EVALUATION_ADAPTER_WAIT_GRACE_SECONDS", "nan")
+    with pytest.raises(WorkbenchError, match="逾時設定"):
+        EvaluationWorkbenchService._client_from_environment()
 
 
 async def _admin_dependency(request: Request) -> dict[str, str]:
@@ -49,7 +78,10 @@ class FakeClient:
         self.started = threading.Event()
         self.release = threading.Event()
         self.block_first = False
+        self.block_content: str | None = None
+        self.block_timeout = 5
         self.clarify_first = False
+        self.clarify_all_first = False
 
     def get_model_snapshot(self) -> dict[str, Any]:
         return {
@@ -107,12 +139,14 @@ class FakeClient:
         del operation_id
         self.sent.append((conversation_id, content))
         self.started.set()
-        if self.block_first and len(self.sent) == 1:
-            self.release.wait(timeout=5)
-        if (
-            self.clarify_first
-            and conversation_id == "chat-1"
-            and len([item for item in self.sent if item[0] == conversation_id]) == 1
+        if (self.block_first and len(self.sent) == 1) or content == self.block_content:
+            self.release.wait(timeout=self.block_timeout)
+        first_turn_for_conversation = (
+            len([item for item in self.sent if item[0] == conversation_id]) == 1
+        )
+        if first_turn_for_conversation and (
+            self.clarify_all_first
+            or (self.clarify_first and conversation_id == "chat-1")
         ):
             assistant = {
                 "role": "assistant",
@@ -198,10 +232,17 @@ def _service(
     )
 
 
-def _app(service: EvaluationWorkbenchService, static_dir: Path) -> FastAPI:
+def _app(
+    service: EvaluationWorkbenchService,
+    static_dir: Path,
+    *,
+    pdf_renderer: Callable[[str], Any] | None = None,
+) -> FastAPI:
     static_dir.mkdir(parents=True, exist_ok=True)
     app = FastAPI()
-    app.include_router(create_api_router(service, _admin_dependency))
+    app.include_router(
+        create_api_router(service, _admin_dependency, pdf_renderer=pdf_renderer)
+    )
     app.mount("/", StaticFiles(directory=static_dir), name="spa")
     return app
 
@@ -216,6 +257,131 @@ def _wait_until(predicate: Any, timeout: float = 3.0) -> None:
         if time.monotonic() >= deadline:
             raise AssertionError("背景評測未在期限內完成")
         time.sleep(0.01)
+
+
+def _wait_for_worker_idle(service: EvaluationWorkbenchService) -> None:
+    _wait_until(
+        lambda: not service._worker_is_running() and not service._has_other_worker()
+    )
+
+
+def _failed_retry_service(
+    tmp_path: Path,
+) -> tuple[EvaluationWorkbenchService, FakeClient, str]:
+    class RetryClient(FakeClient):
+        def send_turn(
+            self, conversation_id: str, content: str, operation_id: str
+        ) -> TurnResult:
+            self.sent.append((conversation_id, content))
+            self.started.set()
+            if len(self.sent) > 1 and self.block_content == content:
+                self.release.wait(timeout=5)
+            return TurnResult(error={"message": "失敗", "retryable": False})
+
+    fake = RetryClient()
+    service = _service(tmp_path / "private", client=fake)
+    data = "1: 原題\n".encode("utf-8")
+    result = service.start_upload("q.txt", data, hashlib.sha256(data).hexdigest())
+    _wait_for_worker_idle(service)
+    return service, fake, result["run_id"]
+
+
+def test_manual_retry_route_permissions_binding_and_double_click(
+    tmp_path: Path,
+) -> None:
+    service, fake, run_id = _failed_retry_service(tmp_path)
+    assert service._read_state(run_id)["manifest"]["max_attempts"] == 1
+    app = _app(service, tmp_path / "static")
+    route = (
+        ROUTES["badmintonai_evaluation_retry"]
+        .replace("{run_id}", run_id)
+        .replace("{question_id}", "1")
+    )
+    admin = {**_post_headers(), "Authorization": "Bearer admin-test"}
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                route,
+                json={"expected_retry_count": 0},
+                headers={**_post_headers(), "Authorization": "Bearer user-test"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                route,
+                json={"expected_retry_count": 0},
+                headers={"Authorization": "Bearer admin-test"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                route.replace("/1/retry", "/99/retry"),
+                json={"expected_retry_count": 0},
+                headers=admin,
+            ).status_code
+            == 409
+        )
+        fake.block_content = "原題"
+        fake.release.clear()
+        response = client.post(route, json={"expected_retry_count": 0}, headers=admin)
+        assert response.status_code == 200
+        repeated = client.post(route, json={"expected_retry_count": 0}, headers=admin)
+        assert repeated.status_code == 200
+        assert repeated.json()["already_queued"] is True
+        fake.release.set()
+        _wait_for_worker_idle(service)
+        assert (
+            client.post(
+                route, json={"expected_retry_count": 0}, headers=admin
+            ).status_code
+            == 409
+        )
+    assert len(fake.sent) == 2
+    assert service._read_state(run_id)["questions"][0]["status"] == "failed"
+
+
+def test_manual_retry_busy_or_unknown_task_never_sends(tmp_path: Path) -> None:
+    service, fake, run_id = _failed_retry_service(tmp_path)
+    lease = service._try_lease()
+    assert lease is not None
+    try:
+        queued = service.retry_failed(run_id, "1", 0)
+        assert queued["accepted"] is True
+        assert queued["already_queued"] is False
+        assert service.status(run_id)["run"]["questions"][0]["work_type"] == "retry"
+    finally:
+        service._release_lease(lease)
+
+    def unknown(*args: Any) -> None:
+        raise OpenWebUIStateUncertain("仍活躍")
+
+    fake.recover_turn = unknown
+    service.resume(run_id)
+    _wait_for_worker_idle(service)
+    assert len(fake.sent) == 1
+    assert service._read_state(run_id)["questions"][0]["status"] == "failed"
+
+
+def test_manual_retry_success_projection_and_exports_agree(tmp_path: Path) -> None:
+    service, fake, run_id = _failed_retry_service(tmp_path)
+
+    def success(conversation_id: str, content: str, operation_id: str) -> TurnResult:
+        fake.sent.append((conversation_id, content))
+        return TurnResult(messages=[{"role": "assistant", "content": "完成"}])
+
+    fake.send_turn = success
+    service.retry_failed(run_id, "1", 0)
+    _wait_for_worker_idle(service)
+    projected = service.status(run_id)["run"]
+    assert projected["questions"][0]["status"] == "completed"
+    assert projected["questions"][0]["manual_retry_succeeded"] is True
+    assert projected["manual_retry_succeeded_count"] == 1
+    exported = json.loads(service.download_json(run_id))
+    assert exported["questions"][0]["turns"][-1]["manual_retry"] is True
+    assert "重試後成功：1 題" in service.download_summary(run_id).decode("utf-8")
+    assert "重試後成功" in service.report_html(run_id).decode("utf-8")
 
 
 def _questions_file(
@@ -429,8 +595,41 @@ def test_html_report_download_and_print_routes_are_admin_only_and_redacted(
     tmp_path: Path,
 ) -> None:
     service = _service(tmp_path / "private")
+    service._plotly_javascript_provider = lambda: (
+        "/*! plotly.js v3.4.0 */ window.Plotly = {};"
+    )
     run_id = "a" * 32
     service.runs_dir.mkdir(parents=True, exist_ok=True)
+    chart_embed = render_plotly_charts_html(
+        validate_plotly_charts(
+            {
+                "schema_version": PLOTLY_SPEC_VERSION,
+                "charts": [
+                    {
+                        "title": "評測 PDF 圖表",
+                        "figure": {
+                            "data": [{"type": "bar", "x": ["A"], "y": [1]}],
+                            "layout": {},
+                        },
+                    }
+                ],
+            },
+            native_validation=False,
+        )
+    )
+    chart_result = {
+        "messages": [
+            {"role": "user", "content": "第一題圖表提問"},
+            {
+                "role": "assistant",
+                "content": "結果 **保留格式**。",
+                "embeds": [chart_embed],
+            },
+        ],
+        "usage": None,
+        "tool_calls": [],
+        "charts": [],
+    }
     state = {
         "schema_version": 1,
         "run_id": run_id,
@@ -450,15 +649,38 @@ def test_html_report_download_and_print_routes_are_admin_only_and_redacted(
                 "processing_elapsed_ms": None,
                 "user_wait_ms": 0,
                 "usage_totals": None,
+                "turns": [
+                    {
+                        "kind": "question",
+                        "request": "第一題圖表提問",
+                        "attempts": [{"duration_ms": 10, "result": chart_result}],
+                    }
+                ],
+                "pending_turn": None,
+            },
+            {
+                "id": "2",
+                "prompt": "第二題多題 PDF 報告驗收。",
+                "status": "completed",
+                "elapsed_ms": 25,
+                "processing_elapsed_ms": 25,
+                "user_wait_ms": 0,
+                "usage_totals": None,
                 "turns": [],
                 "pending_turn": None,
-            }
+            },
         ],
     }
     (service.runs_dir / f"{run_id}.json").write_text(
         json.dumps(state, ensure_ascii=False), encoding="utf-8"
     )
-    app = _app(service, tmp_path / "static")
+    rendered_html: list[str] = []
+
+    async def fake_pdf_renderer(document: str) -> bytes:
+        rendered_html.append(document)
+        return b"%PDF-1.7\nfixture"
+
+    app = _app(service, tmp_path / "static", pdf_renderer=fake_pdf_renderer)
 
     with TestClient(app) as client:
         path = ROUTES["badmintonai_evaluation_download_html"].replace(
@@ -471,12 +693,21 @@ def test_html_report_download_and_print_routes_are_admin_only_and_redacted(
         printable = client.get(
             print_path, headers={"Authorization": "Bearer admin-test"}
         )
+        pdf_path = ROUTES["badmintonai_evaluation_download_pdf"].replace(
+            "{run_id}", run_id
+        )
+        direct_pdf = client.get(
+            pdf_path, headers={"Authorization": "Bearer admin-test"}
+        )
+        regular_user_pdf = client.get(
+            pdf_path, headers={"Authorization": "Bearer user-test"}
+        )
         invalid_id = client.get(
             path.replace(run_id, "../escape"),
             headers={"Authorization": "Bearer admin-test"},
         )
 
-    assert downloaded.status_code == 200
+    assert downloaded.status_code == 200, downloaded.text
     assert downloaded.headers["content-type"].startswith("text/html")
     assert (
         'attachment; filename="evaluation-' in downloaded.headers["content-disposition"]
@@ -485,9 +716,26 @@ def test_html_report_download_and_print_routes_are_admin_only_and_redacted(
     assert "admin-test-secret" not in downloaded.text
     assert "未提供（null）" in downloaded.text
     assert "此題未產生圖表。" in downloaded.text
+    assert "第二題多題 PDF 報告驗收。" in downloaded.text
     assert printable.status_code == 200
     assert 'inline; filename="evaluation-' in printable.headers["content-disposition"]
     assert "window.print()" in printable.text
+    assert direct_pdf.status_code == 200
+    assert direct_pdf.headers["content-type"] == "application/pdf"
+    assert direct_pdf.content.startswith(b"%PDF-")
+    assert direct_pdf.headers["content-disposition"] == (
+        f'attachment; filename="evaluation-{run_id}.pdf"'
+    )
+    assert "report.pdf" in ROUTES["badmintonai_evaluation_download_pdf"]
+    assert rendered_html and run_id in rendered_html[0]
+    assert (
+        'window.__BADMINTON_PDF_RENDER__ = {status: "pending", error: null}'
+        in rendered_html[0]
+    )
+    assert "評測 PDF 圖表" in rendered_html[0]
+    assert "第二題多題 PDF 報告驗收。" in rendered_html[0]
+    assert 'pdfState.status = "ready"' in rendered_html[0]
+    assert regular_user_pdf.status_code == 403
     assert invalid_id.status_code == 404
 
 
@@ -649,7 +897,7 @@ def test_q4_processing_time_excludes_saved_manual_wait_without_rewriting_checkpo
     assert "處理耗時（不含人工等待）：00:35.513" in summary
     assert checkpoint.read_bytes() == original
     assert "未取得模型實際用量" in summary
-    assert not any(path.endswith(".pdf") for path in ROUTES.values())
+    assert ROUTES["badmintonai_evaluation_download_pdf"].endswith("report.pdf")
 
 
 def test_report_asset_fetch_runs_off_event_loop(tmp_path: Path) -> None:
@@ -796,6 +1044,82 @@ def test_ui_only_exposes_safe_conversation_ids_for_local_chat_links() -> None:
     assert question_view("https://attacker.example")["conversation_id"] is None
 
 
+def _saved_partial_analysis_chart_result() -> dict[str, Any]:
+    """以真實 renderer／adapter 建立合法部分產物，再模擬後續圖表失敗。"""
+    embed = render_plotly_charts_html(
+        validate_plotly_charts(
+            {
+                "schema_version": PLOTLY_SPEC_VERSION,
+                "charts": [
+                    {
+                        "title": "擊球事件筆數",
+                        "figure": {
+                            "data": [{"type": "bar", "x": ["全部事件"], "y": [5191]}],
+                            "layout": {},
+                        },
+                    }
+                ],
+            },
+            native_validation=False,
+        )
+    )
+    assistant = {
+        "role": "assistant",
+        "done": True,
+        "content": "資料筆數分析與圖表已完成：共有 5,191 筆擊球事件；後續空間圖表尚未完成。",
+        "embeds": [embed],
+        "error": {"content": "互動圖表附加狀態不明且未讀到後續圖表；需要人工複核"},
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-ok",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-ok",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": "a" * 48,
+                                "artifacts": [
+                                    {
+                                        "relative_path": "event_count.json",
+                                        "text_preview": '{"event_count":5191}',
+                                    }
+                                ],
+                            }
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+    result = _turn_result(
+        {
+            "chat": {
+                "history": {
+                    "messages": {
+                        "user": {
+                            "role": "user",
+                            "content": "先計算資料筆數，再畫空間分布",
+                        },
+                        "assistant": assistant,
+                    }
+                }
+            }
+        },
+        "user",
+        "assistant",
+        lambda _: False,
+    )
+    assert result is not None and result.charts
+    return asdict(result)
+
+
 @pytest.mark.parametrize(
     ("question_data", "expected_message", "expected_display_status"),
     [
@@ -829,11 +1153,24 @@ def test_ui_only_exposes_safe_conversation_ids_for_local_chat_links() -> None:
                             "messages": [
                                 {
                                     "role": "assistant",
-                                    "content": "raw provider detail org-id-987",
+                                    "content": "資料筆數分析已完成：共有 5,191 筆擊球事件。球種比較尚未完成。",
                                 }
                             ],
                             "tool_calls": [
-                                {"name": "runPythonAnalysis", "status": "failed"}
+                                {
+                                    "name": "runPythonAnalysis",
+                                    "status": "completed",
+                                    "output": {
+                                        "status": "ok",
+                                        "files": [
+                                            {
+                                                "relative_path": "event_count.json",
+                                                "text_preview": '{"event_count":5191}',
+                                            }
+                                        ],
+                                    },
+                                },
+                                {"name": "runPythonAnalysis", "status": "failed"},
                             ],
                             "charts": [],
                         }
@@ -852,7 +1189,7 @@ def test_ui_only_exposes_safe_conversation_ids_for_local_chat_links() -> None:
                             "messages": [
                                 {
                                     "role": "assistant",
-                                    "content": "raw provider detail org-id-987",
+                                    "content": "已確認本次使用完整逐拍資料，欄位查詢尚未完成，未交付依賴該欄位的結論。",
                                 }
                             ],
                             "tool_calls": [
@@ -873,23 +1210,7 @@ def test_ui_only_exposes_safe_conversation_ids_for_local_chat_links() -> None:
         (
             {
                 "status": "failed",
-                "turns": [
-                    {
-                        "result": {
-                            "error": {
-                                "message": "互動圖表附加狀態不明且未讀到圖表；需要人工複核"
-                            },
-                            "messages": [
-                                {
-                                    "role": "assistant",
-                                    "content": "模型聲稱圖表已附加，但 raw provider detail org-id-987",
-                                }
-                            ],
-                            "tool_calls": [],
-                            "charts": [],
-                        }
-                    }
-                ],
+                "turns": [{"result": _saved_partial_analysis_chart_result()}],
             },
             "圖表附加狀態未確認",
             "failed",
@@ -919,7 +1240,7 @@ def test_ui_only_exposes_safe_conversation_ids_for_local_chat_links() -> None:
                             "messages": [
                                 {
                                     "role": "assistant",
-                                    "content": "raw provider detail org-id-987",
+                                    "content": "已確認資料範圍；本輪分析工具未完成，需人工複核。",
                                 }
                             ],
                             "tool_calls": [
@@ -967,10 +1288,99 @@ def test_ui_failure_message_is_safe_and_prevents_completed_appearance(
     assert "org-id-987" not in question["failure_message"]
     assert "provider-secret" not in question["failure_message"]
     assert "raw provider detail" not in question["failure_message"]
-    assert question["assistant_text"] == ""
+    saved_partial = (
+        question_data["turns"][-1]["result"]["messages"][-1]["content"]
+        if question_data["status"] == "failed"
+        else ""
+    )
+    assert question["assistant_text"] == saved_partial
+    assert "org-id-987" not in question["assistant_text"]
+    assert "provider-secret" not in question["assistant_text"]
+    assert "raw provider detail" not in question["assistant_text"]
+    assert question["chart_count"] == sum(
+        len(turn.get("result", {}).get("charts", []))
+        for turn in question_data.get("turns", [])
+    )
     if question_data["status"] == "completed":
         assert question["status"] == "completed"
         assert state["questions"][0]["status"] == "completed"
+
+
+def test_ui_renders_known_render_failure_distinctly() -> None:
+    state = {
+        "run_id": "f" * 32,
+        "manifest": {
+            "question_source": {},
+            "model_snapshot": {},
+            "data_snapshot": {},
+        },
+        "questions": [
+            {
+                "id": "1",
+                "prompt": "原題",
+                "status": "failed",
+                "retry_count": 0,
+                "usage_totals": {},
+                "turns": [
+                    {
+                        "result": {
+                            "error": {
+                                "code": "render_failed",
+                                "message": "安全固定訊息",
+                            },
+                            "messages": [],
+                            "tool_calls": [],
+                            "charts": [],
+                        }
+                    }
+                ],
+                "errors": [],
+            }
+        ],
+    }
+
+    question = _state_for_ui(state)["questions"][0]
+    assert question["display_status"] == "failed"
+    assert (
+        question["failure_message"] == "圖表產生或附加失敗；請查看原對話中的既有結果。"
+    )
+
+
+def test_ui_keeps_unknown_render_state_message_for_legacy_errors() -> None:
+    state = {
+        "run_id": "f" * 32,
+        "manifest": {
+            "question_source": {},
+            "model_snapshot": {},
+            "data_snapshot": {},
+        },
+        "questions": [
+            {
+                "id": "1",
+                "prompt": "原題",
+                "status": "failed",
+                "retry_count": 0,
+                "usage_totals": {},
+                "turns": [
+                    {
+                        "result": {
+                            "error": {
+                                "message": "互動圖表的發布狀態無法確認；請先查看原對話是否已有圖表，避免重複發布。"
+                            },
+                            "messages": [],
+                            "tool_calls": [],
+                            "charts": [],
+                        }
+                    }
+                ],
+                "errors": [],
+            }
+        ],
+    }
+
+    question = _state_for_ui(state)["questions"][0]
+    assert question["display_status"] == "failed"
+    assert "圖表附加狀態未確認" in question["failure_message"]
 
 
 def test_workbench_card_renders_projected_status_and_failure_as_text() -> None:
@@ -1067,6 +1477,75 @@ def test_ui_projects_only_correlated_unattached_chart_failure(
     else:
         assert question["failure_message"] is None
         assert question["assistant_text"] == "已完成分析。"
+
+
+def test_failed_question_preserves_original_assistant_stop_message() -> None:
+    stop_message = "分析未完成；已停止自動修正，本次不提供未驗證的統計數值。"
+    call = {
+        "type": "function_call",
+        "id": "analysis-limit",
+        "call_id": "analysis-limit",
+        "name": "runPythonAnalysis",
+        "status": "failed",
+    }
+    assistant = {
+        "role": "assistant",
+        "content": stop_message,
+        "output": [
+            call,
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-limit",
+                "status": "failed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "code": "analysis_message_limit",
+                                "details": {"terminal": True},
+                            }
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+    state = {
+        "run_id": "f" * 32,
+        "manifest": {
+            "question_source": {},
+            "model_snapshot": {},
+            "data_snapshot": {},
+        },
+        "questions": [
+            {
+                "id": "64",
+                "prompt": "原始分析題",
+                "status": "failed",
+                "retry_count": 0,
+                "usage_totals": {},
+                "turns": [
+                    {
+                        "result": {
+                            "messages": [assistant],
+                            "tool_calls": [call],
+                            "charts": [],
+                        }
+                    }
+                ],
+                "errors": [],
+            }
+        ],
+    }
+
+    overview = _state_for_ui(state)
+    question = overview["questions"][0]
+
+    assert question["status"] == "failed"
+    assert question["display_status"] == "failed"
+    assert "分析執行次數已達上限" in question["failure_message"]
+    assert question["assistant_text"] == stop_message
 
 
 def test_ui_prefers_completed_clarification_tool_question_and_choices() -> None:
@@ -1383,31 +1862,324 @@ def test_start_stop_resume_is_single_worker_persistent_and_never_repeats_complet
     started = service.start_source("v2-natural-100", source_hash)
     assert started["run_status"] == "running"
     assert client.started.wait(timeout=1)
-    with pytest.raises(WorkbenchError, match="另一個評測工作"):
-        _service(storage, question_file=question_file).start_source(
-            "v2-natural-100", source_hash
-        )
+    queued_service = _service(storage, question_file=question_file, client=client)
+    queued_result: dict[str, Any] = {}
+    queued_errors: list[BaseException] = []
 
-    stopping = service.stop()
+    def enqueue_another_run() -> None:
+        try:
+            queued_result.update(
+                queued_service.start_source("v2-natural-100", source_hash)
+            )
+        except BaseException as exc:
+            queued_errors.append(exc)
+
+    start_thread = threading.Thread(target=enqueue_another_run)
+    start_thread.start()
+    _wait_until(
+        lambda: any(
+            item.get("run_id") != started["run_id"]
+            for item in json.loads(
+                service._clarification_queue_path.read_text(encoding="utf-8")
+            )["items"]
+        )
+    )
+
+    stopping = service.stop(expected_run_id=started["run_id"])
     assert stopping["run_status"] == "stopping"
     client.release.set()
+    start_thread.join(timeout=5)
+    assert not start_thread.is_alive()
+    assert queued_errors == []
+    queued_run_id = queued_result["run_id"]
+    assert queued_run_id != started["run_id"]
+    assert queued_result["run_status"] == "queued"
     _wait_until(lambda: not service._worker_is_running())
-    stopped = service.status()
+    stopped = service.status(started["run_id"])
     assert stopped["run_status"] == "stopped"
-    run_id = stopped["run_id"]
+    run_id = started["run_id"]
+    assert service.status(queued_run_id)["run_status"] == "completed"
 
-    resumed = service.resume()
+    resumed = service.resume(run_id)
     assert resumed["run_status"] in {"running", "completed"}
     _wait_until(lambda: not service._worker_is_running())
-    final = service.status()
+    final = service.status(run_id)
     assert final["run_status"] == "completed"
-    assert len(client.sent) == 2
+    assert len(client.sent) == 4
     assert [item["status"] for item in final["run"]["questions"]] == [
         "completed",
         "completed",
     ]
     saved = json.loads(service.download_json(run_id))
     assert saved["questions"][0]["turns"][0]["request"] == "第一題原文？"
+
+
+def test_original_q1_to_q3_precede_busy_clarification_and_retry(tmp_path: Path) -> None:
+    class QueueOrderClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.clarify_first = True
+            self.q3_started = threading.Event()
+            self.q3_release = threading.Event()
+            self.q2_calls = 0
+
+        def send_turn(
+            self, conversation_id: str, content: str, operation_id: str
+        ) -> TurnResult:
+            if content == "Q3 原題":
+                self.sent.append((conversation_id, content))
+                self.q3_started.set()
+                self.q3_release.wait(timeout=5)
+                return TurnResult(
+                    messages=[{"role": "assistant", "content": "Q3 完成"}]
+                )
+            if content == "Q2 原題":
+                self.sent.append((conversation_id, content))
+                self.q2_calls += 1
+                if self.q2_calls == 1:
+                    return TurnResult(
+                        error={"message": "429 rate limit", "retryable": False}
+                    )
+                return TurnResult(
+                    messages=[{"role": "assistant", "content": "Q2 重試成功"}]
+                )
+            if content == "Q1 補答":
+                self.sent.append((conversation_id, content))
+                return TurnResult(
+                    messages=[{"role": "assistant", "content": "Q1 補答完成"}]
+                )
+            return super().send_turn(conversation_id, content, operation_id)
+
+    client = QueueOrderClient()
+    source = _questions_file(
+        tmp_path / "ordered.txt", "1: Q1 原題\n2: Q2 原題\n3: Q3 原題\n"
+    )
+    service = _service(tmp_path / "private", question_file=source, client=client)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    run_id = service.start_source("v2-natural-100", digest)["run_id"]
+    assert client.q3_started.wait(timeout=3)
+
+    clarification = service.clarify("1", "Q1 補答", run_id=run_id)
+    retry = service.retry_failed(run_id, "2", expected_retry_count=0)
+    assert clarification["already_queued"] is False
+    assert retry["already_queued"] is False
+    assert [
+        (item["question_id"], item.get("work_type"), item["status"])
+        for item in service._clarification_queue_items(run_id)
+    ] == [
+        ("3", "question", "executing"),
+        ("1", "clarification", "queued"),
+        ("2", "retry", "queued"),
+    ]
+
+    client.q3_release.set()
+    _wait_for_worker_idle(service)
+    assert [content for _conversation_id, content in client.sent] == [
+        "Q1 原題",
+        "Q2 原題",
+        "Q3 原題",
+        "Q1 補答",
+        "Q2 原題",
+    ]
+    completed = service.status(run_id)["run"]["questions"]
+    assert [question["status"] for question in completed] == [
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert completed[1]["manual_retry_succeeded"] is True
+
+
+def test_new_run_keeps_paused_run_selectable_and_stale_stop_cannot_switch_pointer(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.block_first = True
+    question_file = _questions_file(tmp_path / "source.txt")
+    storage = tmp_path / "private"
+    service = _service(storage, question_file=question_file, client=client)
+    source_hash = hashlib.sha256(question_file.read_bytes()).hexdigest()
+
+    first = service.start_source("v2-natural-100", source_hash)
+    first_run_id = first["run_id"]
+    assert client.started.wait(timeout=1)
+    service.stop(expected_run_id=first_run_id)
+    client.release.set()
+    _wait_for_worker_idle(service)
+    first_checkpoint = storage / "runs" / f"{first_run_id}.json"
+    paused_bytes = first_checkpoint.read_bytes()
+
+    second = service.start_source("v2-natural-100", source_hash)
+    second_run_id = second["run_id"]
+    assert second_run_id != first_run_id
+    _wait_for_worker_idle(service)
+    assert first_checkpoint.read_bytes() == paused_bytes
+    assert (storage / "runs" / f"{second_run_id}.json").is_file()
+
+    selected = service.status(first_run_id)
+    assert selected["run_id"] == first_run_id
+    assert selected["active_run_id"] == second_run_id
+    assert selected["can_resume"] is True
+    with pytest.raises(WorkbenchError, match="run 已切換"):
+        service.stop(expected_run_id=first_run_id)
+    assert service._read_pointer()["run_id"] == second_run_id
+    app = _app(service, tmp_path / "static")
+    with TestClient(app) as http:
+        selected_response = http.get(
+            ROUTES["badmintonai_evaluation_status"],
+            params={"run_id": first_run_id},
+            headers={"Authorization": "Bearer admin-test"},
+        )
+        stale_stop_response = http.post(
+            ROUTES["badmintonai_evaluation_stop"],
+            json={"run_id": first_run_id},
+            headers={
+                **_post_headers(),
+                "Authorization": "Bearer admin-test",
+            },
+        )
+    assert selected_response.status_code == 200
+    assert selected_response.json()["run_id"] == first_run_id
+    assert selected_response.json()["active_run_id"] == second_run_id
+    assert stale_stop_response.status_code == 409
+    assert service._read_pointer()["run_id"] == second_run_id
+
+    resumed = service.resume(first_run_id)
+    assert resumed["run_id"] == first_run_id
+    _wait_for_worker_idle(service)
+    assert service.status()["run_id"] == first_run_id
+    assert service.status()["run_status"] == "completed"
+    assert (storage / "runs" / f"{second_run_id}.json").is_file()
+
+
+def test_queued_run_can_pause_and_resume_while_another_run_is_executing(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.block_first = True
+    question_file = _questions_file(tmp_path / "source.txt", "1: Q1 原題\n2: Q2 原題\n")
+    storage = tmp_path / "private"
+    active_service = _service(storage, question_file=question_file, client=client)
+    digest = hashlib.sha256(question_file.read_bytes()).hexdigest()
+    active = active_service.start_source("v2-natural-100", digest)
+    active_run_id = active["run_id"]
+    assert client.started.wait(timeout=1)
+
+    queued_service = _service(storage, question_file=question_file, client=client)
+    queued = queued_service.start_source("v2-natural-100", digest)
+    queued_run_id = queued["run_id"]
+    assert queued["run_status"] == "queued"
+    assert queued_service._read_pointer()["run_id"] == active_run_id
+    before_pause = queued_service.status(queued_run_id)
+    assert before_pause["worker_running"] is True
+    assert before_pause["can_stop"] is True
+    assert before_pause["can_resume"] is False
+
+    app = _app(queued_service, tmp_path / "static")
+    admin = {**_post_headers(), "Authorization": "Bearer admin-test"}
+    with TestClient(app) as http:
+        paused = http.post(
+            ROUTES["badmintonai_evaluation_stop"],
+            json={"run_id": queued_run_id},
+            headers=admin,
+        )
+        assert paused.status_code == 200
+        paused_state = paused.json()
+        assert paused_state["run_id"] == queued_run_id
+        assert paused_state["active_run_id"] == active_run_id
+        assert paused_state["worker_running"] is True
+        assert paused_state["run_status"] == "stopped"
+        assert paused_state["can_resume"] is True
+        assert queued_service._read_pointer()["run_id"] == active_run_id
+
+        resumed = http.post(
+            ROUTES["badmintonai_evaluation_resume"],
+            json={"run_id": queued_run_id},
+            headers=admin,
+        )
+        assert resumed.status_code == 200
+        resumed_state = resumed.json()
+        assert resumed_state["run_id"] == queued_run_id
+        assert resumed_state["active_run_id"] == active_run_id
+        assert resumed_state["worker_running"] is True
+        assert resumed_state["run_status"] == "queued"
+        assert resumed_state["can_resume"] is False
+        assert queued_service._read_pointer()["run_id"] == active_run_id
+
+    client.release.set()
+    _wait_for_worker_idle(active_service)
+    _wait_for_worker_idle(queued_service)
+    assert active_service.status(active_run_id)["run_status"] == "completed"
+    assert queued_service.status(queued_run_id)["run_status"] == "completed"
+    assert len(client.sent) == 4
+
+
+def test_terminal_failed_run_with_queued_retry_can_be_paused(tmp_path: Path) -> None:
+    service, _fake, run_id = _failed_retry_service(tmp_path)
+    lease = service._try_lease()
+    assert lease is not None
+    try:
+        accepted = service.retry_failed(run_id, "1", expected_retry_count=0)
+        assert accepted["accepted"] is True
+        assert service._read_state(run_id)["questions"][0]["status"] == "failed"
+        assert service.status(run_id)["can_stop"] is True
+
+        app = _app(service, tmp_path / "static")
+        with TestClient(app) as http:
+            response = http.post(
+                ROUTES["badmintonai_evaluation_stop"],
+                json={"run_id": run_id},
+                headers={
+                    **_post_headers(),
+                    "Authorization": "Bearer admin-test",
+                },
+            )
+        assert response.status_code == 200
+        paused = response.json()
+        assert paused["run_id"] == run_id
+        assert paused["can_resume"] is True
+        assert paused["run"]["questions"][0]["work_type"] == "retry"
+        assert service._run_is_paused(run_id) is True
+    finally:
+        service._release_lease(lease)
+
+    stopped = service.status(run_id)
+    assert stopped["run_status"] == "stopped"
+    assert stopped["can_resume"] is True
+    assert service._worker_is_running() is False
+    assert service._queue_has_work(run_id) is True
+
+
+def test_unanswered_run_can_be_clarified_after_a_new_run_finishes(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient()
+    client.clarify_first = True
+    question_file = _questions_file(tmp_path / "source.txt")
+    service = _service(tmp_path / "private", question_file=question_file, client=client)
+    source_hash = hashlib.sha256(question_file.read_bytes()).hexdigest()
+
+    first = service.start_source("v2-natural-100", source_hash)
+    first_run_id = first["run_id"]
+    _wait_for_worker_idle(service)
+    assert service.status(first_run_id)["run_status"] == "awaiting_clarification"
+
+    second = service.start_source("v2-natural-100", source_hash)
+    second_run_id = second["run_id"]
+    _wait_for_worker_idle(service)
+    assert service.status()["run_id"] == second_run_id
+
+    clarified = service.clarify("1", "選項 A", run_id=first_run_id)
+    assert clarified["run_id"] == first_run_id
+    _wait_for_worker_idle(service)
+    first_question = next(
+        question
+        for question in service.status()["run"]["questions"]
+        if question["id"] == "1"
+    )
+    assert first_question["status"] == "completed"
+    assert client.sent[-1] == ("chat-1", "選項 A")
+    assert (service.runs_dir / f"{second_run_id}.json").is_file()
 
 
 def test_question_clarification_keeps_original_message_choices_and_same_chat(
@@ -1464,13 +2236,16 @@ def test_restart_recovers_saved_pending_run_and_downloads_keep_missing_usage_nul
     service._write_pointer(run_id, paused=False)
 
     recovered = _service(storage, question_file=source, client=client)
-    assert recovered.recover_after_restart() is True
+    assert recovered.recover_after_restart() is False
+    assert recovered.status(run_id)["run"]["questions"][0]["status"] == "pending"
+    assert client.sent == []
+    recovered.resume(run_id)
     _wait_until(lambda: not recovered._worker_is_running())
     json_download = recovered.download_json(run_id).decode("utf-8")
     summary_download = recovered.download_summary(run_id).decode("utf-8")
     status_body = json.dumps(recovered.status(), ensure_ascii=False)
 
-    assert recovered.status()["run_status"] == "completed"
+    assert recovered.status(run_id)["run_status"] == "completed"
     assert runner.snapshot()["questions"][0]["turns"][0]["result"]["usage"] is None
     assert "admin-test-secret" not in json_download
     assert "admin-test-secret" not in summary_download
@@ -1479,7 +2254,7 @@ def test_restart_recovers_saved_pending_run_and_downloads_keep_missing_usage_nul
         tmp_path / "private" / "runs" / f"{run_id}.json"
     ).read_text(encoding="utf-8")
     assert '"usage": null' in json_download
-    assert "Token：input_tokens=未取得模型實際用量" in summary_download
+    assert "尚未取得模型實際用量" in summary_download
 
 
 def test_upload_start_requires_matching_preview_digest_and_persists_private_state(
@@ -1667,3 +2442,580 @@ def test_selected_start_rechecks_original_source_digest_before_side_effects(
         )
 
     assert not storage.exists()
+
+
+def _service_with_two_waiting_questions(
+    tmp_path: Path, *, client: FakeClient | None = None
+):
+    source = _questions_file(
+        tmp_path / "waiting-questions.txt",
+        "1: 等待補答第一題\n2: 等待補答第二題\n",
+    )
+    client = client or FakeClient()
+    client.clarify_all_first = True
+    service = _service(tmp_path / "private", question_file=source, client=client)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    run_id = service.start_source("v2-natural-100", digest)["run_id"]
+    _wait_for_worker_idle(service)
+    assert [item["status"] for item in service.status(run_id)["run"]["questions"]] == [
+        "awaiting_clarification",
+        "awaiting_clarification",
+    ]
+    client.clarify_all_first = False
+    return service, client, source, run_id
+
+
+def test_clarifications_enqueue_while_busy_and_drain_fifo_at_question_boundary(
+    tmp_path: Path,
+) -> None:
+    service, client, source, waiting_run_id = _service_with_two_waiting_questions(
+        tmp_path
+    )
+    waiting_checkpoint = service.runs_dir / f"{waiting_run_id}.json"
+    checkpoint_before = waiting_checkpoint.read_bytes()
+
+    client.started.clear()
+    client.block_content = "等待補答第一題"
+    busy = service.start_source(
+        "v2-natural-100", hashlib.sha256(source.read_bytes()).hexdigest()
+    )
+    assert client.started.wait(timeout=2)
+    _wait_until(lambda: service._worker_is_running())
+    try:
+        queued_q2 = service.clarify("2", "第二題先補", run_id=waiting_run_id)
+        queued_q1 = service.clarify("1", "第一題後補", run_id=waiting_run_id)
+        assert queued_q2["run"]["queued_clarification_count"] == 1
+        assert queued_q1["run"]["queued_clarification_count"] == 2
+        assert waiting_checkpoint.read_bytes() == checkpoint_before
+        repeated = service.clarify("2", "重複補答", run_id=waiting_run_id)
+        assert repeated["already_queued"] is True
+    finally:
+        client.release.set()
+
+    _wait_for_worker_idle(service)
+    queued_answers = [
+        content
+        for _conversation_id, content in client.sent
+        if content in {"第二題先補", "第一題後補"}
+    ]
+    assert queued_answers == ["第二題先補", "第一題後補"]
+    assert service.status(waiting_run_id)["run"]["queued_clarification_count"] == 0
+    assert service.status(busy["run_id"])["run_status"] == "completed"
+
+
+def test_queued_clarification_can_be_edited_or_cancelled_without_checkpoint_write(
+    tmp_path: Path,
+) -> None:
+    service, _client, _source, run_id = _service_with_two_waiting_questions(tmp_path)
+    checkpoint = service.runs_dir / f"{run_id}.json"
+    original_checkpoint = checkpoint.read_bytes()
+    lease = service._try_lease()
+    assert lease is not None
+    try:
+        saved = service.clarify("1", "原補答", run_id=run_id)
+        question = saved["run"]["questions"][0]
+        assert question["display_status"] == "queued"
+        assert question["queued_clarification"]["answer"] == "原補答"
+        assert checkpoint.read_bytes() == original_checkpoint
+        repeated = service.clarify("1", "重複補答", run_id=run_id)
+        assert repeated["already_queued"] is True
+
+        updated = service.update_queued_clarification(run_id, "1", "修改後補答")
+        assert updated["run"]["questions"][0]["queued_clarification"]["answer"] == (
+            "修改後補答"
+        )
+        cancelled = service.cancel_queued_clarification(run_id, "1")
+        assert cancelled["run"]["queued_clarification_count"] == 0
+        assert cancelled["run"]["questions"][0]["status"] == ("awaiting_clarification")
+        service.clarify("1", "API 原補答", run_id=run_id)
+        update_path = ROUTES[
+            "badmintonai_evaluation_clarification_queue_update"
+        ].format(run_id=run_id, question_id="1")
+        cancel_path = ROUTES[
+            "badmintonai_evaluation_clarification_queue_cancel"
+        ].format(run_id=run_id, question_id="1")
+        app = _app(service, tmp_path / "static")
+        with TestClient(app) as http:
+            missing_origin_update = http.patch(
+                update_path,
+                json={"answer": "不應保存"},
+                headers={"Authorization": "Bearer admin-test"},
+            )
+            foreign_origin_cancel = http.delete(
+                cancel_path,
+                headers={
+                    "Authorization": "Bearer admin-test",
+                    "Origin": "https://attacker.example",
+                },
+            )
+            updated_response = http.patch(
+                update_path,
+                json={"answer": "API 修改後補答"},
+                headers={
+                    **_post_headers(),
+                    "Authorization": "Bearer admin-test",
+                },
+            )
+            cancelled_response = http.delete(
+                cancel_path,
+                headers={
+                    **_post_headers(),
+                    "Authorization": "Bearer admin-test",
+                },
+            )
+        assert updated_response.status_code == 200
+        assert missing_origin_update.status_code == 403
+        assert foreign_origin_cancel.status_code == 403
+        assert (
+            updated_response.json()["run"]["questions"][0]["queued_clarification"][
+                "answer"
+            ]
+            == "API 修改後補答"
+        )
+        assert cancelled_response.status_code == 200
+        assert cancelled_response.json()["run"]["queued_clarification_count"] == 0
+        assert checkpoint.read_bytes() == original_checkpoint
+    finally:
+        service._release_lease(lease)
+
+
+def test_legacy_event_conflict_is_read_projected_and_answered_via_queue(
+    tmp_path: Path,
+) -> None:
+    service, client, _source, run_id = _service_with_two_waiting_questions(tmp_path)
+    checkpoint = service.runs_dir / f"{run_id}.json"
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    question = state["questions"][0]
+    question["status"] = "needs_review"
+    question["clarification_review_reason"] = "舊版事件衝突"
+    result = question["turns"][-1]["result"]
+    result["clarification_signal"] = "event_conflict"
+    result["error"] = {"message": "舊版衝突標記", "retryable": False}
+    checkpoint.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    saved_legacy_checkpoint = checkpoint.read_bytes()
+
+    read_projection = service.get_run(run_id)
+    projected_question = read_projection["run"]["questions"][0]
+    assert projected_question["status"] == "awaiting_clarification"
+    assert projected_question["checkpoint_status"] == "needs_review"
+    assert projected_question["clarification_projection"] == "legacy_event_conflict"
+    assert "唯讀相容投影" in projected_question["clarification_projection_note"]
+    assert projected_question["assistant_text"] == "請選擇 A 或 B"
+    assert projected_question["clarification_review_candidate"] is False
+    assert read_projection["run"]["status_counts"]["awaiting_clarification"] == 2
+    assert read_projection["run_status"] == "awaiting_clarification"
+    assert checkpoint.read_bytes() == saved_legacy_checkpoint
+
+    lease = service._try_lease()
+    assert lease is not None
+    try:
+        queued = service.clarify("1", "選擇 A", run_id=run_id)
+        queued_question = queued["run"]["questions"][0]
+        assert queued_question["display_status"] == "queued"
+        assert queued_question["queued_clarification"]["answer"] == "選擇 A"
+        assert checkpoint.read_bytes() == saved_legacy_checkpoint
+        updated = service.update_queued_clarification(run_id, "1", "修改後 A")
+        assert updated["run"]["questions"][0]["queued_clarification"]["answer"] == (
+            "修改後 A"
+        )
+        cancelled = service.cancel_queued_clarification(run_id, "1")
+        assert cancelled["run"]["questions"][0]["status"] == ("awaiting_clarification")
+        assert checkpoint.read_bytes() == saved_legacy_checkpoint
+        service.clarify("1", "選擇 A", run_id=run_id)
+    finally:
+        service._release_lease(lease)
+
+    service.resume(run_id)
+    _wait_for_worker_idle(service)
+    completed = service.get_run(run_id)["run"]["questions"][0]
+    assert completed["status"] == "completed"
+    assert checkpoint.read_bytes() != saved_legacy_checkpoint
+    saved_question = json.loads(checkpoint.read_text(encoding="utf-8"))["questions"][0]
+    assert saved_question["clarification_legacy_projection"] == "legacy_event_conflict"
+    assert saved_question["turns"][0]["result"]["error"]["message"] == "舊版衝突標記"
+    assert any(content == "選擇 A" for _chat, content in client.sent)
+
+
+def test_event_conflict_without_completed_question_is_not_projected_or_queued(
+    tmp_path: Path,
+) -> None:
+    service, _client, _source, run_id = _service_with_two_waiting_questions(tmp_path)
+    checkpoint = service.runs_dir / f"{run_id}.json"
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    question = state["questions"][0]
+    question["status"] = "needs_review"
+    result = question["turns"][-1]["result"]
+    result["clarification_signal"] = "event_conflict"
+    assistant = result["messages"][-1]
+    assistant["output"][0]["arguments"] = '{"question":"  "}'
+    checkpoint.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    before = checkpoint.read_bytes()
+
+    projected = service.get_run(run_id)["run"]["questions"][0]
+    assert projected["status"] == "needs_review"
+    assert projected["clarification_projection"] is None
+    with pytest.raises(WorkbenchError, match="不等待澄清"):
+        service.clarify("1", "猜一個", run_id=run_id)
+    assert checkpoint.read_bytes() == before
+
+
+def test_paused_run_queue_is_skipped_until_explicit_resume(
+    tmp_path: Path,
+) -> None:
+    source = _questions_file(
+        tmp_path / "three-questions.txt",
+        "1: 等待補答第一題\n2: 等待補答第二題\n3: 尚未執行的第三題\n",
+    )
+    client = FakeClient()
+    client.clarify_all_first = True
+    client.block_content = "等待補答第二題"
+    service = _service(tmp_path / "private", question_file=source, client=client)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    waiting_run_id = service.start_source("v2-natural-100", digest)["run_id"]
+    _wait_until(
+        lambda: any(content == "等待補答第二題" for _chat, content in client.sent)
+    )
+    service.stop(expected_run_id=waiting_run_id)
+    client.release.set()
+    _wait_for_worker_idle(service)
+    waiting_questions = service.status(waiting_run_id)["run"]["questions"]
+    assert [item["status"] for item in waiting_questions] == [
+        "awaiting_clarification",
+        "awaiting_clarification",
+        "pending",
+    ]
+
+    client.clarify_all_first = False
+    client.block_content = "等待補答第一題"
+    client.release.clear()
+    client.started.clear()
+    busy = service.start_source("v2-natural-100", digest)
+    _wait_until(
+        lambda: (
+            service._worker_is_running()
+            and bool(client.sent)
+            and client.sent[-1][1] == "等待補答第一題"
+        )
+    )
+    try:
+        service.clarify("2", "另一輪第二題先補", run_id=waiting_run_id)
+        service.clarify("1", "另一輪第一題後補", run_id=waiting_run_id)
+    finally:
+        client.release.set()
+
+    _wait_for_worker_idle(service)
+    queued_answers = [
+        content
+        for _chat, content in client.sent
+        if content in {"另一輪第二題先補", "另一輪第一題後補"}
+    ]
+    assert queued_answers == []
+    assert service.status(waiting_run_id)["run"]["queued_clarification_count"] == 2
+    service.resume(waiting_run_id)
+    _wait_for_worker_idle(service)
+    queued_answers = [
+        content
+        for _chat, content in client.sent
+        if content in {"另一輪第二題先補", "另一輪第一題後補"}
+    ]
+    assert queued_answers == ["另一輪第二題先補", "另一輪第一題後補"]
+    finished_waiting_run = service.status(waiting_run_id)["run"]["questions"]
+    assert [item["status"] for item in finished_waiting_run] == [
+        "completed",
+        "completed",
+        "completed",
+    ]
+    assert any(content == "尚未執行的第三題" for _chat, content in client.sent)
+    assert service.status(busy["run_id"])["run_status"] == "completed"
+
+
+def test_running_queued_clarification_cannot_be_edited_or_cancelled(
+    tmp_path: Path,
+) -> None:
+    service, client, _source, run_id = _service_with_two_waiting_questions(tmp_path)
+    client.block_content = "開始執行的補答"
+    client.release.clear()
+    service.clarify("1", "開始執行的補答", run_id=run_id)
+    _wait_until(
+        lambda: any(content == "開始執行的補答" for _chat, content in client.sent)
+    )
+    question = service.status(run_id)["run"]["questions"][0]
+    assert question["display_status"] == "running"
+    with pytest.raises(WorkbenchError, match="已開始執行，無法修改"):
+        service.update_queued_clarification(run_id, "1", "不能修改")
+    with pytest.raises(WorkbenchError, match="已開始執行，無法取消"):
+        service.cancel_queued_clarification(run_id, "1")
+    client.release.set()
+    _wait_for_worker_idle(service)
+    assert service.status(run_id)["run"]["questions"][0]["status"] == "completed"
+
+
+def test_queued_answer_survives_restart_but_explicit_stop_requires_resume(
+    tmp_path: Path,
+) -> None:
+    service, client, source, run_id = _service_with_two_waiting_questions(tmp_path)
+    lease = service._try_lease()
+    assert lease is not None
+    try:
+        service.clarify("1", "重啟後補答", run_id=run_id)
+    finally:
+        service._release_lease(lease)
+
+    service.stop(expected_run_id=run_id)
+    restarted = _service(service.storage_dir, question_file=source, client=client)
+    assert restarted.recover_after_restart() is False
+    persisted = restarted.status(run_id)["run"]
+    assert persisted["queued_clarification_count"] == 1
+    assert persisted["questions"][0]["queued_clarification"]["answer"] == ("重啟後補答")
+    assert not any(content == "重啟後補答" for _chat, content in client.sent)
+
+    restarted.resume(run_id)
+    _wait_for_worker_idle(restarted)
+    completed = restarted.status(run_id)["run"]["questions"][0]
+    assert completed["status"] == "completed"
+    assert client.sent[-1] == ("chat-1", "重啟後補答")
+
+
+def test_uncertain_queued_recovery_uses_stoppable_backoff_and_preserves_fifo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UncertainQueueClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.uncertain_operation_id: str | None = None
+            self.recovery_calls = 0
+            self.recovery_success = False
+
+        def send_turn(
+            self, conversation_id: str, content: str, operation_id: str
+        ) -> TurnResult:
+            if content == "狀態不明的第一題補答":
+                self.sent.append((conversation_id, content))
+                self.uncertain_operation_id = operation_id
+                raise OpenWebUIStateUncertain("completion 狀態未確認")
+            return super().send_turn(conversation_id, content, operation_id)
+
+        def recover_turn(
+            self, conversation_id: str, operation_id: str
+        ) -> TurnResult | None:
+            if operation_id != self.uncertain_operation_id:
+                return None
+            self.recovery_calls += 1
+            if self.recovery_success:
+                return TurnResult(
+                    messages=[
+                        {"role": "user", "content": "狀態不明的第一題補答"},
+                        {"role": "assistant", "content": "已恢復完成"},
+                    ]
+                )
+            raise OpenWebUIStateUncertain("task 仍在執行，狀態尚未確認")
+
+    monkeypatch.setattr(
+        EvaluationRunner, "CLARIFICATION_RECOVERY_BACKOFF_INITIAL_SECONDS", 0.5
+    )
+    monkeypatch.setattr(
+        EvaluationRunner, "CLARIFICATION_RECOVERY_BACKOFF_MAX_SECONDS", 2.0
+    )
+    client = UncertainQueueClient()
+    client.clarify_all_first = True
+    service, client, _source, run_id = _service_with_two_waiting_questions(
+        tmp_path, client=client
+    )
+
+    service.clarify("1", "狀態不明的第一題補答", run_id=run_id)
+    _wait_until(lambda: client.recovery_calls == 1)
+
+    def first_retry_is_scheduled() -> bool:
+        queue_items = json.loads(
+            service._clarification_queue_path.read_text(encoding="utf-8")
+        )["items"]
+        entry = next(item for item in queue_items if item["question_id"] == "1")
+        return isinstance(entry.get("next_attempt_at"), str)
+
+    _wait_until(first_retry_is_scheduled)
+    question = service._read_state(run_id)["questions"][0]
+    pending = question["pending_turn"]
+    queue_id = pending["queue_id"]
+    assert question["status"] == "running"
+    assert not any(turn.get("queue_id") == queue_id for turn in question["turns"]), (
+        "恢復尚未確認前不得將補答寫為完成 turn"
+    )
+    queued_entry = next(
+        item
+        for item in json.loads(
+            service._clarification_queue_path.read_text(encoding="utf-8")
+        )["items"]
+        if item["queue_id"] == queue_id
+    )
+    assert queued_entry["status"] == "executing"
+    assert queued_entry["answer"] == "狀態不明的第一題補答"
+    assert isinstance(queued_entry.get("next_attempt_at"), str)
+    time.sleep(0.1)
+    assert client.recovery_calls == 1, "backoff 期間不得重複查詢遠端 task"
+
+    service.clarify("2", "後續可執行的第二題補答", run_id=run_id)
+    _wait_until(
+        lambda: service._read_state(run_id)["questions"][1]["status"] == "completed"
+    )
+    _wait_until(lambda: client.recovery_calls >= 2)
+    _wait_until(
+        lambda: (
+            service._read_state(run_id)["questions"][0]["pending_turn"]["attempts"][
+                -1
+            ].get("recovery_failure_count")
+            == 2
+        )
+    )
+    state = service._read_state(run_id)
+    first_question = state["questions"][0]
+    second_question = state["questions"][1]
+    assert first_question["status"] == "running"
+    assert first_question["pending_turn"]["queue_id"] == queue_id
+    assert second_question["status"] == "completed", (
+        "較後的可執行補答不得被不確定項目阻擋"
+    )
+    recovery_errors = [
+        error
+        for error in first_question["errors"]
+        if error.get("stage") == "recover_turn"
+        and error.get("operation_id") == client.uncertain_operation_id
+    ]
+    assert len(recovery_errors) == 1, "重複 uncertain recovery error 應去重"
+    assert (
+        sum(content == "狀態不明的第一題補答" for _chat, content in client.sent) == 1
+    ), "task 尚存時不得重送 completion"
+
+    service.stop(expected_run_id=run_id)
+    _wait_for_worker_idle(service)
+    assert service.recover_after_restart() is False, "明確停止後重啟不得暗中恢復"
+
+    client.recovery_success = True
+    checkpoint_path = service.runs_dir / f"{run_id}.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint["questions"][0]["pending_turn"]["attempts"][-1][
+        "recovery_not_before"
+    ] = "2000-01-01T00:00:00+00:00"
+    checkpoint_path.write_text(
+        json.dumps(checkpoint, ensure_ascii=False), encoding="utf-8"
+    )
+    queue_state = json.loads(
+        service._clarification_queue_path.read_text(encoding="utf-8")
+    )
+    next(item for item in queue_state["items"] if item["queue_id"] == queue_id)[
+        "next_attempt_at"
+    ] = "2000-01-01T00:00:00+00:00"
+    service._clarification_queue_path.write_text(
+        json.dumps(queue_state, ensure_ascii=False), encoding="utf-8"
+    )
+
+    service.resume(run_id)
+    _wait_for_worker_idle(service)
+    finished = service._read_state(run_id)
+    assert [question["status"] for question in finished["questions"]] == [
+        "completed",
+        "completed",
+    ]
+    assert finished["questions"][0]["pending_turn"] is None
+    assert client.recovery_calls == 3
+    assert sum(content == "狀態不明的第一題補答" for _chat, content in client.sent) == 1
+    assert service.status(run_id)["run"]["queued_clarification_count"] == 0
+
+
+def test_expired_queued_clarification_is_discarded_without_sending_to_chat(
+    tmp_path: Path,
+) -> None:
+    service, client, _source, run_id = _service_with_two_waiting_questions(tmp_path)
+    lease = service._try_lease()
+    assert lease is not None
+    service.clarify("1", "不可送出的舊補答", run_id=run_id)
+    state_path = service.runs_dir / f"{run_id}.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["questions"][0]["status"] = "completed"
+    state["questions"][0]["completed_at"] = "2026-10-03T00:00:00+00:00"
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    service._release_lease(lease)
+
+    assert service.recover_after_restart() is False
+    assert service.status(run_id)["run"]["queued_clarification_count"] == 1
+    service.resume(run_id)
+    _wait_for_worker_idle(service)
+    _wait_for_worker_idle(service)
+    assert not any(content == "不可送出的舊補答" for _chat, content in client.sent)
+    assert service.status(run_id)["run"]["queued_clarification_count"] == 0
+
+
+def test_queue_wait_is_not_counted_as_processing_time(tmp_path: Path) -> None:
+    service, _client, _source, run_id = _service_with_two_waiting_questions(tmp_path)
+    lease = service._try_lease()
+    assert lease is not None
+    service.clarify("1", "計時補答", run_id=run_id)
+    service._release_lease(lease)
+    time.sleep(1.2)
+
+    service.resume(run_id)
+    _wait_for_worker_idle(service)
+    question = service.status(run_id)["run"]["questions"][0]
+    assert question["processing_elapsed_ms"] == sum(
+        attempt["duration_ms"]
+        for turn in service._read_state(run_id)["questions"][0]["turns"]
+        for attempt in turn["attempts"]
+    )
+    assert (
+        question["elapsed_ms"]
+        - question["user_wait_ms"]
+        - question["processing_elapsed_ms"]
+        >= 500
+    )
+
+
+def test_ui_projection_distinguishes_queued_and_executing_clarification() -> None:
+    state = {
+        "run_id": "a" * 32,
+        "manifest": {},
+        "questions": [
+            {
+                "id": "1",
+                "prompt": "題目",
+                "status": "awaiting_clarification",
+                "turns": [],
+                "errors": [],
+                "usage_totals": {},
+            }
+        ],
+    }
+    queued = _state_for_ui(
+        state,
+        clarification_queue=[
+            {
+                "question_id": "1",
+                "queue_id": "queued-id",
+                "status": "queued",
+                "answer": "已保存補答",
+            }
+        ],
+    )
+    executing = _state_for_ui(
+        state,
+        clarification_queue=[
+            {
+                "question_id": "1",
+                "queue_id": "running-id",
+                "status": "executing",
+                "answer": "已開始執行",
+            }
+        ],
+    )
+    assert queued["queued_clarification_count"] == 1
+    assert queued["queued_work_count"] == 1
+    assert queued["questions"][0]["display_status"] == "queued"
+    assert set(queued["status_counts"]) == {
+        "queued",
+        "running",
+        "awaiting_clarification",
+        "completed",
+        "failed",
+        "needs_review",
+    }
+    assert queued["questions"][0]["queued_clarification"]["answer"] == "已保存補答"
+    assert executing["questions"][0]["display_status"] == "running"

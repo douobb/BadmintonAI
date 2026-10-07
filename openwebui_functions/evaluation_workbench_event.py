@@ -2,7 +2,7 @@
 title: BadmintonAI Evaluation Workbench
 author: BadmintonAI
 version: 0.2.0
-description: Registers the administrator-only resumable evaluation workbench.
+description: 註冊管理員專用評測工作台，並依登入者權限提供聊天匯出路由。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import Depends
 from fastapi.responses import FileResponse, HTMLResponse
-from open_webui.utils.auth import get_admin_user
+from open_webui.utils.auth import get_admin_user, get_current_user
 from starlette.routing import Mount
 
 _RUNTIME_ROOT = Path("/opt/badmintonai-evaluation")
@@ -61,6 +61,7 @@ _PAGE_HTML = """<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     <title>評測工作台 | BadmintonAI</title>
+    <link rel="icon" type="image/png" href="/static/favicon.png">
     <link rel="stylesheet" href="/badmintonai/evaluation/assets/workbench.css">
     <script src="/badmintonai/evaluation/assets/workbench.js" defer></script>
   </head>
@@ -90,6 +91,7 @@ _PAGE_HTML = """<!doctype html>
             </div>
             <span id="run-status" class="status-pill" role="status">讀取中</span>
           </div>
+          <p id="selected-run-notice" class="help" hidden></p>
           <div class="actions">
             <button id="stop-button" class="danger" type="button" disabled>停止</button>
             <button id="resume-button" class="secondary" type="button" disabled>續跑</button>
@@ -104,17 +106,17 @@ _PAGE_HTML = """<!doctype html>
               </div>
             </div>
             <ul id="status-legend" class="status-legend" aria-label="題目狀態圖例">
-              <li><span class="state-swatch state-pending" aria-hidden="true"></span>待執行</li>
+              <li><span class="state-swatch state-queued" aria-hidden="true"></span>排隊中</li>
               <li><span class="state-swatch state-running" aria-hidden="true"></span>執行中</li>
-              <li><span class="state-swatch state-awaiting_clarification" aria-hidden="true"></span>等待補答</li>
-              <li><span class="state-swatch state-needs_review" aria-hidden="true"></span>需要複核</li>
-              <li><span class="state-swatch state-completed" aria-hidden="true"></span>已完成</li>
+              <li><span class="state-swatch state-awaiting_clarification" aria-hidden="true"></span>待補答</li>
+              <li><span class="state-swatch state-completed" aria-hidden="true"></span>完成</li>
               <li><span class="state-swatch state-failed" aria-hidden="true"></span>失敗</li>
+              <li><span class="state-swatch state-needs_review" aria-hidden="true"></span>需複核</li>
             </ul>
             <ol id="question-matrix" class="question-matrix" aria-label="目前 run 題目狀態矩陣；使用 Tab 聚焦題目，按 Enter 或空白鍵開啟詳情"></ol>
           </section>
           <section class="subsection" aria-labelledby="clarification-title">
-            <h3 id="clarification-title">待補答題目</h3>
+            <h3 id="clarification-title">待補答工作</h3>
             <p class="help">選取題目以查看追問、可用選項並送回同一對話。</p>
             <ul id="clarification-list" class="question-list"></ul>
           </section>
@@ -124,7 +126,7 @@ _PAGE_HTML = """<!doctype html>
           <div class="page-heading">
             <div>
               <h2 id="new-title">預覽與選題</h2>
-              <p class="help">先預覽原題，再選擇本輪要執行的題目；預設全選。</p>
+              <p class="help">先預覽原題，再選擇本輪要執行的題目；預設全選。未完成舊輪會保留紀錄；若仍在執行，開始前會先安全停止並等待目前回合結束。</p>
             </div>
           </div>
           <section class="panel" aria-labelledby="source-title">
@@ -181,16 +183,11 @@ _PAGE_HTML = """<!doctype html>
           <div class="page-heading">
             <div>
               <h2 id="recent-title">近期紀錄</h2>
-              <p class="help">檢視摘要、離線報告與逐題人工複核註記。</p>
+              <p class="help">選擇 run 進度檢視摘要矩陣、逐題詳情與人工複核註記；註記另存，不改寫凍結 checkpoint，也可下載離線報告。</p>
             </div>
           </div>
           <section class="panel">
             <ul id="recent-runs" class="run-list"></ul>
-            <section id="historical-run-detail" hidden aria-labelledby="historical-run-title">
-              <h3 id="historical-run-title">歷史 run 題目複核</h3>
-              <p class="help">人工分類註記會另外保存；凍結 checkpoint 的原始狀態與回合不會被改寫。</p>
-              <ol id="historical-question-matrix" class="question-matrix" aria-label="歷史 run 題目狀態矩陣；選取題目可檢視詳情"></ol>
-            </section>
           </section>
         </section>
       </main>
@@ -351,7 +348,11 @@ def _register_routes(app: Any) -> None:
             name=_JS_ROUTE_NAME,
             include_in_schema=False,
         )
-        app.include_router(create_api_router(_workbench(), get_admin_user))
+        app.include_router(
+            create_api_router(
+                _workbench(), get_admin_user, user_dependency=get_current_user
+            )
+        )
     _move_owned_routes_before_root_mount(app)
 
 
@@ -364,7 +365,7 @@ def _unregister_routes(app: Any) -> None:
 
 
 class Event:
-    """在 Open WebUI startup/enable 掛載同站管理員工作台。"""
+    """在 Open WebUI startup/enable 掛載管理員工作台與使用者權限聊天匯出 API。"""
 
     async def event(
         self,

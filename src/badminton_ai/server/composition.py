@@ -18,12 +18,15 @@ from ..data import (
 )
 from ..data.models import DatasetSnapshot, MetadataSnapshot
 from ..query import BadmintonQueryService
-from ..sandbox import DockerSandboxRunner
+from ..sandbox import DEFAULT_SANDBOX_IMAGE, DockerSandboxRunner, SandboxPolicy
 from ..settings import AppSettings, load_settings
+from .result_store import AnalysisResultStore
 
 ENV_DATA_FILE = "BADMINTON_AI_DATA_FILE"
 ENV_METADATA_DIR = "BADMINTON_AI_METADATA_DIR"
 ENV_SQLITE_TABLE = "BADMINTON_AI_SQLITE_TABLE"
+ENV_SANDBOX_IMAGE = "BADMINTON_AI_SANDBOX_IMAGE"
+ENV_ANALYSIS_RESULTS_DIR = "BADMINTON_AI_ANALYSIS_RESULTS_DIR"
 DEFAULT_SQLITE_TABLE = "match_data"
 SUPPORTED_SQLITE_SUFFIXES = frozenset({".db", ".sqlite", ".sqlite3"})
 
@@ -39,6 +42,7 @@ class ToolServices:
     query: BadmintonQueryService
     catalog: BadmintonCatalogService
     sandbox: DockerSandboxRunner
+    analysis_results: AnalysisResultStore | None = None
 
 
 def build_services(
@@ -86,10 +90,15 @@ def build_services(
         validate_registry_covers_columns(snapshot, metadata)
 
     query = BadmintonQueryService(snapshot, metadata)
+    image = values.get(ENV_SANDBOX_IMAGE, "").strip() or DEFAULT_SANDBOX_IMAGE
+    results_dir = values.get(ENV_ANALYSIS_RESULTS_DIR, "").strip() or str(
+        app_settings.runtime_dir / "analysis-results"
+    )
     return ToolServices(
         query=query,
         catalog=BadmintonCatalogService(query),
-        sandbox=sandbox or DockerSandboxRunner(),
+        sandbox=sandbox or DockerSandboxRunner(policy=SandboxPolicy(image=image)),
+        analysis_results=AnalysisResultStore(results_dir),
     )
 
 
@@ -156,6 +165,8 @@ __all__ = [
     "DEFAULT_SQLITE_TABLE",
     "ENV_DATA_FILE",
     "ENV_METADATA_DIR",
+    "ENV_ANALYSIS_RESULTS_DIR",
+    "ENV_SANDBOX_IMAGE",
     "ENV_SQLITE_TABLE",
     "CompositionError",
     "ToolServices",

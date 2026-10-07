@@ -228,7 +228,13 @@ def test_q3_embed_is_safely_rebuilt_offline_and_printable() -> None:
     assert 'window.addEventListener("beforeprint"' in document
     assert 'window.addEventListener("afterprint"' in document
     assert "window.print()" in document
-    assert "本系統不提供直接 PDF API" in document
+    assert "可下載 PDF 或 HTML 離線報告" in document
+    assert (
+        'window.__BADMINTON_PDF_RENDER__ = {status: "pending", error: null}' in document
+    )
+    assert 'pdfState.status = "ready"' in document
+    assert 'pdfState.status = "error"' in document
+    assert "圖表無法完成繪製，因此不會產生不完整 PDF" in document
     assert "plotly.js v3.4.0" in document
 
 
@@ -310,7 +316,10 @@ def test_q85_clarification_includes_both_rounds_and_user_answer() -> None:
     assert "按球種序列計算，採選項 1。" in document
     assert "採用球種序列，統計結果為 25%。" in document
     assert "第 2 輪補答" in document
-    assert "input_tokens=80" in document
+    assert "input_tokens: 已取得 20" in document
+    assert "output_tokens: 已取得 10" in document
+    assert "total_tokens: 已取得 30" in document
+    assert "缺少 1 次用量；實際可能更高" in document
 
 
 def test_report_escapes_untrusted_content_and_never_copies_embed_html() -> None:

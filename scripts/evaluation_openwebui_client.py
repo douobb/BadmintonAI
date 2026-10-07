@@ -26,6 +26,51 @@ _CHART_FINGERPRINT = re.compile(
     r'<meta name="badmintonai-chart-fingerprint" content="sha256:([0-9a-f]{64})">'
 )
 _TOOL_CALL_TYPES = {"function_call", "tool_call"}
+_ANALYSIS_TERMINAL_CODES = frozenset(
+    {
+        "analysis_message_limit",
+        "analysis_retry_limit",
+        "analysis_terminated",
+        "sandbox_timeout",
+        "sandbox_unavailable",
+        "sandbox_execution_failure",
+    }
+)
+_BADMINTONAI_STREAM_ERRORS = {
+    "badmintonai_stream_no_data_timeout": "模型服務串流等待資料逾時；回合已停止，未完成輸出不視為完成。",
+    "badmintonai_stream_no_progress_timeout": "模型服務串流未持續產生回答或工具參數；回合已停止，未完成部分不視為已驗證。",
+    "badmintonai_stream_total_timeout": "模型服務串流達到總等待上限；回合已停止，未完成輸出不視為完成。",
+    "badmintonai_stream_upstream_error": "模型服務串流中斷；回合已停止，未完成輸出不視為完成。",
+    "badmintonai_stream_incomplete": "模型服務串流未正常結束；回合已停止，未完成輸出不視為完成。",
+}
+_UNEXECUTED_TOOL_OUTPUTS = frozenset(
+    {
+        "本輪已因工具終止狀態停止；工具呼叫未執行。",
+        "澄清已提交；本輪其餘工具呼叫未執行。",
+        "工具呼叫因本輪錯誤而未執行。",
+        "分析執行額度已保留給本輪收尾；此分析呼叫未執行。",
+        "無進展收尾已停止；此工具呼叫未執行。",
+        "工具呼叫因達到本輪上限而未執行。",
+    }
+)
+_FIXED_TOOL_TURN_FAILURES = {
+    "本則回答的分析執行次數已用完，且仍有未解錯誤或沒有可驗證的保存結果；分析未完成，不提供未驗證數值。": (
+        "analysis_message_limit",
+        "分析執行次數已達上限，且沒有可驗證的完整結果；未完成部分不視為已驗證結論。",
+    ),
+    "本輪收尾未能產生可靠的最終答覆；已保存結果與已發布圖表仍保留，不提供未驗證的結論或數值。": (
+        "analysis_incomplete",
+        "本輪收尾未能產生可驗證的完整答覆；已保存結果與圖表保留，未完成部分不視為結論。",
+    ),
+    "已停止重複呼叫；收尾仍要求工具，本輪未執行該呼叫，未完成部分不提供未驗證結論。": (
+        "analysis_incomplete",
+        "收尾仍要求工具，因此本輪未完成；未完成部分不視為已驗證結論。",
+    ),
+    "本輪已達工具呼叫上限，尚未完成；不提供未驗證的結論或數值。": (
+        "analysis_incomplete",
+        "本輪已達工具呼叫上限；未完成部分不視為已驗證結論。",
+    ),
+}
 _QUOTED_SPAN = re.compile(r"「[^」\n]*」|『[^』\n]*』|“[^”\n]*”|\"[^\"\n]*\"")
 _MARKDOWN_QUOTE_LINE = re.compile(r"(?m)^\s*>.*$")
 _CHOICE_LINE = re.compile(r"(?m)^\s*(?:\d+[.)、]|[A-Za-z][.)]|[-*•])\s+\S")
@@ -47,6 +92,48 @@ _CHOICE_REQUEST = re.compile(
 )
 _TAIPEI_TIMEZONE = timezone(timedelta(hours=8))
 _EVALUATION_ROOT_FOLDER = "評測"
+_TOOL_EVENT_CONTRACT_API = (
+    "decode_tool_payload",
+    "decode_tool_result_payload",
+    "decode_tool_error_payload",
+    "is_unexecuted_tool_output",
+)
+
+
+def _load_tool_event_contract() -> Any:
+    """先用已安裝的 Open WebUI helper；本機開發時才讀 repo source。"""
+
+    try:
+        from open_webui import evaluation_observability as contract
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"open_webui", "open_webui.evaluation_observability"}:
+            raise
+        try:
+            from openwebui_patch import evaluation_observability as contract
+        except ModuleNotFoundError as source_exc:
+            if source_exc.name not in {
+                "openwebui_patch",
+                "openwebui_patch.evaluation_observability",
+            }:
+                raise
+            raise RuntimeError(
+                "找不到相容的 evaluation_observability helper；請以新版部署來源更新 Open WebUI helper。"
+            ) from source_exc
+
+    missing = [
+        name
+        for name in _TOOL_EVENT_CONTRACT_API
+        if not callable(getattr(contract, name, None))
+    ]
+    if missing:
+        raise RuntimeError(
+            "Open WebUI evaluation_observability helper 與掛載的評測 client 版本不相容；"
+            "請更新 helper 映像，缺少 API：" + ", ".join(missing)
+        )
+    return contract
+
+
+_tool_event_contract = _load_tool_event_contract()
 
 
 class OpenWebUIClientError(RuntimeError):
@@ -280,7 +367,10 @@ class OpenWebUIEvaluationClient:
             "id": assistant_message_id,
             "session_id": _message_id(operation_id, "session"),
             "user_message": user_message,
-            "assistant_message_id": assistant_message_id,
+            # 由固定版 Open WebUI chat endpoint 取出並併入伺服器 metadata；
+            # 不放進 metadata（該端點會覆蓋之），也不帶入供應商 payload。
+            "badmintonai_evaluation": True,
+            "badmintonai_operation_id": operation_id,
             "tool_ids": tool_ids,
         }
 
@@ -328,6 +418,20 @@ class OpenWebUIEvaluationClient:
                 "尚無可確認的 assistant 結果；保留待復原狀態，不重送回合"
             )
         return result
+
+    def assert_retry_idle(self, conversation_id: str) -> None:
+        """人工 Retry 前只查原生任務；未知或活躍時保留讀回，不重送。"""
+        encoded_id = urllib.parse.quote(conversation_id, safe="")
+        try:
+            payload = self._request_json("GET", f"/api/tasks/chat/{encoded_id}")
+        except Exception as exc:
+            raise OpenWebUIStateUncertain("無法確認原生任務狀態，未重送") from exc
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("task_ids"), list
+        ):
+            raise OpenWebUIStateUncertain("原生任務清單格式未知，未重送")
+        if payload["task_ids"]:
+            raise OpenWebUIStateUncertain("原生任務仍執行，未重送")
 
     def _validate_model_snapshot(self, model_snapshot: Any) -> None:
         if not isinstance(model_snapshot, dict):
@@ -822,15 +926,36 @@ def _turn_result(
     message_error = assistant_message.get("error")
     error = None
     if message_error:
-        error_message = (
+        error_content = (
             (message_error.get("content") or message_error.get("message"))
             if isinstance(message_error, dict)
             else str(message_error)
         )
-        error = {
-            "message": str(error_message or "Open WebUI assistant message failed"),
-            "retryable": False,
-        }
+        error_payload = (
+            error_content
+            if isinstance(error_content, dict)
+            else _decode_tool_result_payload(error_content)
+            if isinstance(error_content, str)
+            else None
+        )
+        if isinstance(error_payload, dict) and isinstance(
+            error_payload.get("error"), dict
+        ):
+            error_payload = error_payload["error"]
+        error_code = (
+            error_payload.get("code") if isinstance(error_payload, dict) else None
+        )
+        if error_code in _BADMINTONAI_STREAM_ERRORS:
+            error = {
+                "code": error_code,
+                "message": _BADMINTONAI_STREAM_ERRORS[error_code],
+                "retryable": False,
+            }
+        else:
+            error = {
+                "message": str(error_content or "Open WebUI assistant message failed"),
+                "retryable": False,
+            }
     if error is None:
         error = _analysis_completion_error(tool_calls, output, charts)
     if error is None and any(
@@ -857,15 +982,6 @@ def _turn_result(
         clarification_review_reason = (
             "requestClarification 事件未完成；需人工確認本輪是否應等待補答"
         )
-    elif completed_clarification_calls and (
-        any(call.get("name") == "runPythonAnalysis" for call in tool_calls) or charts
-    ):
-        clarification_signal = "event_conflict"
-        clarification_review_reason = "本輪同時要求澄清並嘗試分析；需人工複核"
-        error = {
-            "message": clarification_review_reason,
-            "retryable": False,
-        }
     elif completed_clarification_calls and not any(
         _clarification_call_has_question(call) for call in completed_clarification_calls
     ):
@@ -920,68 +1036,290 @@ def _analysis_completion_error(
 ) -> dict[str, Any] | None:
     """僅依工具狀態判定已知未完成；不猜測回答文字或語意正確性。"""
 
+    fixed_turn_failure: dict[str, Any] | None = None
+    if isinstance(output, list):
+        for item in output:
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "message"
+                or item.get("role") != "assistant"
+            ):
+                continue
+            fixed_failure = _FIXED_TOOL_TURN_FAILURES.get(
+                _content_text(item.get("content")).strip()
+            )
+            if fixed_failure is not None:
+                code, message = fixed_failure
+                fixed_turn_failure = {
+                    "code": code,
+                    "message": message,
+                    "retryable": False,
+                }
+                break
+
     analyses = [call for call in tool_calls if call.get("name") == "runPythonAnalysis"]
-    if not analyses:
-        return None
-    if all(call.get("status") == "failed" for call in analyses):
+    renderers = [
+        call for call in tool_calls if call.get("name") == "renderAnalysisChart"
+    ]
+    if not analyses and not renderers:
+        return fixed_turn_failure
+
+    analysis_outcome: str | None = None
+    analysis_terminal_error: dict[str, Any] | None = None
+    for call in analyses:
+        call_id = call.get("call_id") or call.get("id")
+        if _tool_was_explicitly_unexecuted(call, output):
+            continue
+        payloads = _tool_result_payloads(call_id, output)
+        outcome: str | None = None
+        for raw_text in payloads:
+            payload = _decode_tool_result_payload(raw_text)
+            if not isinstance(payload, dict):
+                continue
+            if isinstance(payload.get("code"), str) or payload.get("error"):
+                outcome = "failure"
+                code = payload.get("code")
+                if isinstance(code, str) and code in _ANALYSIS_TERMINAL_CODES:
+                    messages = {
+                        "analysis_message_limit": "分析執行次數已達上限；本輪已停止，未完成部分不視為已驗證結論。",
+                        "analysis_retry_limit": "分析修正次數已達上限；本輪已停止，未完成部分不視為已驗證結論。",
+                        "analysis_terminated": "分析因基礎設施錯誤停止；不提供未驗證結論。",
+                        "sandbox_timeout": "分析執行逾時並已停止；不提供未驗證結論。",
+                        "sandbox_unavailable": "分析環境無法使用；本輪已停止，未完成部分不視為已驗證結論。",
+                        "sandbox_execution_failure": "分析環境執行失敗並已停止；不提供未驗證結論。",
+                    }
+                    analysis_terminal_error = {
+                        "code": code,
+                        "message": messages[code],
+                        "retryable": False,
+                    }
+            elif (
+                isinstance(payload.get("result_id"), str)
+                and bool(payload.get("result_id"))
+                and isinstance(payload.get("artifacts"), list)
+                and any(
+                    isinstance(artifact, dict)
+                    and isinstance(artifact.get("relative_path"), str)
+                    and bool(artifact["relative_path"].strip())
+                    for artifact in payload["artifacts"]
+                )
+            ):
+                outcome = "success"
+            elif (
+                isinstance(payload.get("stdout_preview"), str)
+                and bool(payload["stdout_preview"].strip())
+                and payload.get("result_id") is None
+                and payload.get("artifacts") == []
+            ):
+                outcome = "probe"
+            elif "result_id" in payload or payload.get("artifacts"):
+                # 宣稱有正式結果但沒有可辨識的已保存檔名，不能當成功。
+                outcome = "failure"
+        if call.get("status") == "failed" and outcome != "success":
+            outcome = "failure"
+        if outcome == "failure":
+            analysis_outcome = "failure"
+        elif outcome == "success":
+            # 只有後續真正保存結果才清除失敗；stdout-only 探查不能洗掉失敗。
+            analysis_outcome = None
+
+    executed_renderers = [
+        call for call in renderers if not _tool_was_explicitly_unexecuted(call, output)
+    ]
+    render_error = (
+        _render_completion_error(executed_renderers, output)
+        if executed_renderers
+        else None
+    )
+    if render_error is not None:
+        return render_error
+    if analysis_terminal_error is not None:
+        return analysis_terminal_error
+    if fixed_turn_failure is not None:
+        return fixed_turn_failure
+    if analysis_outcome == "failure":
         return {
             "message": "Python 分析工具未成功完成；回答需要人工複核",
             "retryable": False,
         }
-    if charts or not isinstance(output, list):
+    if not isinstance(output, list):
         return None
 
-    successful_ids = {
-        call.get("call_id") or call.get("id")
-        for call in analyses
-        if call.get("status") == "completed"
-        and isinstance(call.get("call_id") or call.get("id"), str)
-    }
+    if not charts:
+        for call in analyses:
+            call_id = call.get("call_id") or call.get("id")
+            for raw_text in _tool_result_payloads(call_id, output):
+                payload = _decode_tool_result_payload(raw_text)
+                status = (
+                    payload.get("rich_ui_status") if isinstance(payload, dict) else None
+                )
+                if status == "embed_unknown":
+                    return {
+                        "message": "互動圖表附加狀態不明且未讀到圖表；需要人工複核",
+                        "retryable": False,
+                    }
+                if status == "invalid_spec":
+                    return {
+                        "message": "互動圖表規格無效且未讀到圖表；需要人工複核",
+                        "retryable": False,
+                    }
+                if status in {
+                    "bridge_not_configured",
+                    "chat_context_missing",
+                    "identity_mismatch",
+                    "embed_failed",
+                }:
+                    return {
+                        "message": "互動圖表未成功附加且未讀到圖表；需要人工複核",
+                        "retryable": False,
+                    }
+    return None
+
+
+def _tool_was_explicitly_unexecuted(call: dict[str, Any], output: Any) -> bool:
+    """只依 middleware 固定 failed 配對文案識別未執行呼叫。"""
+
+    call_id = call.get("call_id") or call.get("id")
+    if (
+        call.get("status") != "failed"
+        or not isinstance(call_id, str)
+        or not isinstance(output, list)
+    ):
+        return False
+    for item in output:
+        if (
+            not isinstance(item, dict)
+            or item.get("type") != "function_call_output"
+            or item.get("call_id") != call_id
+            or item.get("status") != "failed"
+        ):
+            continue
+        if _tool_event_contract.is_unexecuted_tool_output(item, call_id):
+            return True
+        blocks = item.get("output")
+        texts = (
+            [blocks]
+            if isinstance(blocks, str)
+            else [
+                block.get("text")
+                for block in blocks
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            ]
+            if isinstance(blocks, list)
+            else []
+        )
+        if any(
+            text.strip() in _UNEXECUTED_TOOL_OUTPUTS
+            for text in texts
+            if isinstance(text, str)
+        ):
+            return True
+    return False
+
+
+def _tool_result_payloads(call_id: Any, output: Any) -> list[str]:
+    if not isinstance(call_id, str) or not call_id or not isinstance(output, list):
+        return []
+    texts: list[str] = []
     for item in output:
         if (
             not isinstance(item, dict)
             or item.get("type") not in {"function_call_output", "tool_result"}
-            or item.get("call_id") not in successful_ids
+            or item.get("call_id") != call_id
         ):
             continue
         blocks = item.get("output")
-        if not isinstance(blocks, list):
-            continue
-        for block in blocks:
-            if (
-                not isinstance(block, dict)
-                or not isinstance(block.get("text"), str)
-                or '"rich_ui_status"' not in block["text"]
-            ):
-                continue
-            try:
-                payload = json.loads(block["text"])
-            except (TypeError, ValueError):
-                continue
-            status = (
-                payload.get("rich_ui_status") if isinstance(payload, dict) else None
+        if isinstance(blocks, str):
+            texts.append(blocks)
+        elif isinstance(blocks, list):
+            texts.extend(
+                block["text"]
+                for block in blocks
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
             )
-            if status == "embed_unknown":
+    return texts
+
+
+def _decode_tool_result_payload(text: str) -> dict[str, Any] | None:
+    """相容舊呼叫名稱；依 middleware 共用的有界 envelope 解碼契約。"""
+
+    return _tool_event_contract.decode_tool_result_payload(text)
+
+
+def _render_completion_error(
+    renderers: list[dict[str, Any]], output: Any
+) -> dict[str, Any] | None:
+    """採最後一次可修正 render 結果；未知或終止狀態不可被後續工具回應洗掉。"""
+
+    if not isinstance(output, list):
+        return {
+            "message": "互動圖表工具結果未能確認；回答需要人工複核",
+            "retryable": False,
+        }
+
+    last_success = False
+    unknown_codes = {"chart_state_unknown", "render_state_unavailable"}
+    terminal_codes = {
+        "chart_state_unknown",
+        "render_retry_limit",
+        "render_terminated",
+        "render_state_unavailable",
+        "chart_bridge_unavailable",
+        "chart_identity_mismatch",
+        "chart_embed_failed",
+    }
+    for call in renderers:
+        call_id = call.get("call_id") or call.get("id")
+        payloads = _tool_result_payloads(call_id, output)
+        outcome: str | None = None
+        terminal = False
+        terminal_code: str | None = None
+        for text in payloads:
+            payload = _decode_tool_result_payload(text)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("status") in {"embedded", "duplicate_suppressed"}:
+                outcome = "success"
+                continue
+            code = payload.get("code")
+            if isinstance(code, str):
+                outcome = "failure"
+                details = payload.get("details")
+                terminal = (
+                    terminal
+                    or (isinstance(details, dict) and details.get("terminal") is True)
+                    or code in terminal_codes
+                )
+                if terminal:
+                    terminal_code = code
+        if call.get("status") == "failed" and outcome is None:
+            outcome = "failure"
+        if terminal:
+            if terminal_code not in unknown_codes:
                 return {
-                    "message": "互動圖表附加狀態不明且未讀到圖表；需要人工複核",
+                    "code": "render_failed",
+                    "message": "互動圖表未能完成發布；已停止自動修正，請查看原對話中的既有結果。",
                     "retryable": False,
                 }
-            if status == "invalid_spec":
-                return {
-                    "message": "互動圖表規格無效且未讀到圖表；需要人工複核",
-                    "retryable": False,
-                }
-            if status in {
-                "bridge_not_configured",
-                "chat_context_missing",
-                "identity_mismatch",
-                "embed_failed",
-            }:
-                return {
-                    "message": "互動圖表未成功附加且未讀到圖表；需要人工複核",
-                    "retryable": False,
-                }
-    return None
+            return {
+                "message": "互動圖表的發布狀態無法確認；請先查看原對話是否已有圖表，避免重複發布。",
+                "retryable": False,
+            }
+        if outcome is None:
+            # 缺少可核對的回覆屬未知狀態；後續工具結果不能洗掉這個不確定性。
+            return {
+                "message": "互動圖表工具結果未能確認；回答需要人工複核",
+                "retryable": False,
+            }
+        last_success = outcome == "success"
+
+    if last_success:
+        return None
+    return {
+        "code": "render_failed",
+        "message": "互動圖表未能完成發布；已停止自動修正，請查看原對話中的既有結果。",
+        "retryable": False,
+    }
 
 
 def _extract_tool_calls(

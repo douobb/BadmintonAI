@@ -302,6 +302,14 @@ def test_chart_count_and_figure_shape_are_bounded() -> None:
         )
 
 
+def test_missing_chart_title_reports_the_exact_outer_chart_contract() -> None:
+    with pytest.raises(
+        PlotlySpecError,
+        match=r"每個 charts 元素必須恰為 \{title, figure\}",
+    ):
+        validate_plotly_charts(_payload({"figure": _figure()}))
+
+
 def test_figure_validator_rejects_unknown_trace_and_non_finite_values() -> None:
     with pytest.raises(PlotlySpecError, match="Plotly figure"):
         validate_plotly_charts(
@@ -372,17 +380,22 @@ def test_artifact_rejects_duplicate_keys_and_invalid_json_constants(raw: bytes) 
         parse_plotly_charts_artifact(_artifact({}, raw=raw))
 
 
-def test_asset_url_is_loopback_only_and_version_pinned() -> None:
+def test_asset_url_is_open_webui_same_origin_and_version_pinned() -> None:
     assert validate_plotly_asset_url(DEFAULT_PLOTLY_ASSET_URL) == (
         DEFAULT_PLOTLY_ASSET_URL
     )
     assert PLOTLY_VERSION == "6.6.0"
     assert PLOTLY_ASSET_PATH.endswith("plotly-6.6.0.min.js")
     for url in (
+        "http://127.0.0.1:8000/assets/plotly-6.6.0.min.js",
+        "http://localhost:8000/assets/plotly-6.6.0.min.js",
         "https://cdn.plot.ly/plotly-6.6.0.min.js",
         "http://example.invalid/assets/plotly-6.6.0.min.js",
         "http://127.0.0.1:8000/plotly.min.js",
         "http://user:pass@127.0.0.1:8000/assets/plotly-6.6.0.min.js",
+        "/badmintonai/assets/plotly-6.5.0.min.js",
+        "/badmintonai/assets/plotly-6.6.0.min.js?url=https://example.invalid",
+        "//example.invalid/badmintonai/assets/plotly-6.6.0.min.js",
     ):
         with pytest.raises(ValueError):
             validate_plotly_asset_url(url)

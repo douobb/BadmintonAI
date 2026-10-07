@@ -12,14 +12,14 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 from .chart_display import MAX_EMBED_HTML_BYTES
 
 PLOTLY_VERSION = "6.6.0"
 PLOTLY_JS_VERSION = "3.4.0"
 PLOTLY_ASSET_PATH = f"/assets/plotly-{PLOTLY_VERSION}.min.js"
-DEFAULT_PLOTLY_ASSET_URL = f"http://127.0.0.1:8000{PLOTLY_ASSET_PATH}"
+PLOTLY_OPEN_WEBUI_ASSET_PATH = f"/badmintonai/assets/plotly-{PLOTLY_VERSION}.min.js"
+DEFAULT_PLOTLY_ASSET_URL = PLOTLY_OPEN_WEBUI_ASSET_PATH
 PLOTLY_CHARTS_FILE = "plotly_charts.json"
 PLOTLY_SPEC_VERSION = "badminton-plotly/v1"
 MAX_PLOTLY_SPEC_BYTES = 1024 * 1024
@@ -142,7 +142,9 @@ def validate_plotly_charts(
             "title",
             "figure",
         }:
-            raise PlotlySpecError("Plotly 圖表欄位不符合契約")
+            raise PlotlySpecError(
+                "Plotly 圖表欄位不符合契約；每個 charts 元素必須恰為 {title, figure}"
+            )
         title = _text(chart_payload["title"], "title", MAX_PLOTLY_TITLE_CHARS)
         figure = chart_payload["figure"]
         if isinstance(figure, str):
@@ -197,32 +199,10 @@ def validate_plotly_charts(
 
 
 def validate_plotly_asset_url(value: str) -> str:
-    """只允許本機 Tool Server 提供的固定版本 JS，不載入遠端 CDN。"""
+    """只允許 Open WebUI 同站路徑，避免瀏覽器連到 Tool Server 或 CDN。"""
 
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > 512
-        or value != value.strip()
-        or any(character.isspace() or ord(character) < 0x20 for character in value)
-    ):
-        raise ValueError("Plotly asset URL 無效")
-    parsed = urlsplit(value)
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("Plotly asset URL 埠號無效") from exc
-    if (
-        parsed.scheme not in {"http", "https"}
-        or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path != PLOTLY_ASSET_PATH
-        or parsed.query
-        or parsed.fragment
-        or (port is not None and not 1 <= port <= 65535)
-    ):
-        raise ValueError("Plotly asset URL 必須指向本機固定版 JS 資產")
+    if value != PLOTLY_OPEN_WEBUI_ASSET_PATH:
+        raise ValueError("Plotly asset URL 必須是 Open WebUI 固定同站路徑")
     return value
 
 
@@ -580,6 +560,7 @@ __all__ = [
     "MAX_PLOTLY_CHARTS",
     "MAX_PLOTLY_SPEC_BYTES",
     "PLOTLY_ASSET_PATH",
+    "PLOTLY_OPEN_WEBUI_ASSET_PATH",
     "PLOTLY_CHARTS_FILE",
     "PLOTLY_SPEC_VERSION",
     "PLOTLY_JS_VERSION",

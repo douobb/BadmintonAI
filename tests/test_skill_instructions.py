@@ -17,7 +17,7 @@ def test_one_compact_prompt_and_one_analysis_skill() -> None:
         "badminton-analysis.md"
     ]
     assert len(prompt) < 800
-    assert len(skill) < 2350
+    assert len(skill) < 3300
     for text in (prompt, skill):
         assert "TASK-" not in text
         assert "chart_spec.json" not in text
@@ -25,31 +25,31 @@ def test_one_compact_prompt_and_one_analysis_skill() -> None:
 
 def test_prompt_keeps_clarification_and_source_routing() -> None:
     prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-    assert "必要時查分析 Skill、核准 Knowledge 或資料／欄位摘要" in prompt
-    assert "欄位探查不用 Python" in prompt
-    assert "確認前不要執行 `runPythonAnalysis`" in prompt
+    assert "必要時查分析 Skill、核准 Knowledge 或資料摘要" in prompt
+    assert "可先用 Python 探查" in prompt
+    assert "未確認前不猜數值" in prompt
     assert "使用者定義優先" in prompt
-    assert "可操作核准定義直接用" in prompt
-    assert "題內示例優先" in prompt
-    assert "術語門檻只在會改變結論且無核准定義時才澄清" in prompt
-    assert "合理假設並明示" in prompt
-    assert "未指定場次時預設目前資料集的全部可用場次" in prompt
+    assert "採核准口徑" in prompt
+    assert "題內示例" in prompt
+    assert "必要條件缺漏會改變結論且無合理預設時" in prompt
+    assert "合理假設須明示" in prompt
+    assert "未指定場次預設目前快照全部可用場次" in prompt
     assert "才呼叫一次 `requestClarification`" in prompt
-    assert "未要求資料驗證的策略建議直接給一般非個人化建議" in prompt
+    assert "策略建議直接給一般非個人化建議" in prompt
     assert "不反問是否改做分析" in prompt
-    assert "明確要求資料依據時按前述規則核對、分析，資料不足則說明限制" in prompt
-    assert "本機統計使用資料工具" in prompt
-    assert "最新賽事、排名、賽程" in prompt
-    assert "搜尋不能替代資料欄位或計算口徑的確認" in prompt
-    assert "搜尋不可用或無可靠來源時明說無法核實" in prompt
+    assert "明確要求資料依據則按前述規則核對分析" in prompt
+    assert "`runPythonAnalysis`" in prompt
+    assert "時效性公開資訊" in prompt
+    assert "欄位口徑仍以核准資料為準" in prompt
+    assert "無可靠來源明說無法核實" in prompt
 
 
 def test_prompt_and_skill_derive_metrics_before_clarifying() -> None:
     prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
     skill = SKILL_PATH.read_text(encoding="utf-8")
     for text in (prompt, skill):
-        assert "澄清前先查核准欄位能否推導常規指標" in text
-        assert "揭露公式與單位" in text
+        assert "能否推導常規指標" in text
+        assert "公式" in text and "單位" in text
         assert "未校準座標不稱公尺" in text
         assert text.index("能否推導常規指標") < text.index(
             "才呼叫一次 `requestClarification`"
@@ -60,37 +60,41 @@ def test_prompt_and_skill_batch_one_analysis_goal_without_call_cap() -> None:
     prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
     skill = SKILL_PATH.read_text(encoding="utf-8")
     for text in (prompt, skill):
-        assert "同一分析目標盡量一次完成計算與必要 artifacts" in text
-        assert "需依前次結果調整才再呼叫" in text
-    assert "零樣本不估計或判高低；不放寬確認條件湊非零或重算" in prompt
-    assert "零樣本不估計或判高低，不放寬條件湊非零" in skill
+        assert "`runPythonAnalysis`" in text
+        assert "renderAnalysisChart" in text
+    assert "零樣本" in prompt and "勝率不可計" in prompt
+    assert "需依結果改統計才重跑" in skill
+    assert all(
+        term in skill for term in ("零樣本", "符合回合 0", "勝率不可計", "不改定義")
+    )
     assert "最多 3 次修正" in skill
+    assert "以已保存的 `result_id` 呼叫 `renderAnalysisChart`" in prompt
 
 
 def test_requested_metric_is_not_substituted_with_all_losses() -> None:
     prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
     skill = SKILL_PATH.read_text(encoding="utf-8")
-    assert "不以相近指標替代" in prompt
-    assert "不得以近似指標替代題意" in skill
-    assert "失誤率按核准口徑計自身終局失誤" in prompt
+    assert "不以近似指標替代" in prompt
+    assert "不得以近似指標替代" in skill
+    assert "失誤依自身終局失誤口徑" in prompt
     assert "失誤次數／率依核准口徑計自身終局失誤" in skill
-    assert "失誤次數同理，未標記原因的失分不當失誤" in prompt
+    assert "未標記原因不推定為失誤" in prompt
     assert "未標記原因仍屬失分分母，但不算已確認失誤" in skill
-    assert "所有失分回合" in prompt and "所有失分回合代替" in skill
-    assert "比例明示分子分母" in prompt
+    assert "所有失分回合代替" in skill
+    assert "公式、單位與分子分母" in prompt
     assert "明示分母" in skill
 
 
 def test_skill_clarifies_ambiguous_terms_without_overasking() -> None:
     skill = SKILL_PATH.read_text(encoding="utf-8")
     assert skill.index("先由題目與前文辨識球員") < skill.index("使用者定義優先")
-    assert "確認前不執行 `runPythonAnalysis`" in skill
-    assert "後場」採區碼 1–4" in skill
-    assert "檢索片段未顯示區碼時查看來源全文" in skill
+    assert "澄清前可用 Python 探查" in skill
+    assert "後場" in skill and "區碼 1–4" in skill
+    assert "檢索片段缺定義時查全文" in skill
     assert "四角拉吊" in skill
-    assert "會改變結論的口徑且無核准定義時澄清" in skill
-    assert "題內示例優先（如「最後 3 拍」），不自創門檻" in skill
-    assert "proxy 不證實真實戰術意圖" in skill
+    assert "會改結論且無核准定義時才澄清" in skill
+    assert "題內示例優先，不自創門檻" in skill
+    assert "proxy 不證實戰術意圖" in skill
     assert "合理假設並明示" in skill
     assert "未指定範圍採目前快照全部可用場次" in skill
     assert "呼叫一次 `requestClarification`" in skill
@@ -99,8 +103,8 @@ def test_skill_clarifies_ambiguous_terms_without_overasking() -> None:
     )
     assert skill.index("使用者定義優先") < skill.index("策略建議給一般非個人化答案")
     assert "要求資料時按前述規則核對並分析" in skill
-    assert "狹窄欄位查詢未命中不能斷言資料沒有該欄位" in skill
-    assert "搜尋不能自動決定分析欄位或門檻" in skill
+    assert "窄查未命中不證明欄位不存在" in skill
+    assert "搜尋釋義" in skill and "不決定欄位或門檻" in skill
     assert "使用者要求不搜尋時遵守" in skill
 
 
@@ -109,6 +113,7 @@ def test_skill_preserves_data_semantics() -> None:
     for rule in (
         "一列代表一筆擊球事件",
         "不把逐拍列數當回合數",
+        "下一拍直接終局與回合最終得分不可互代",
         "核對 `df.columns`、schema 與欄位定義",
         '`getpoint_player == ""` 是非終局事件的空字串標記',
         "`isna()`／`dropna()` 不會移除它",
@@ -124,14 +129,17 @@ def test_skill_preserves_data_semantics() -> None:
         "不可先篩資料再 `shift`",
         "有效樣本",
         "player_location_area",
+        "hit_area",
         "landing_area",
+        "對手位置",
+        "前場 17–24、中場 5–16、後場 1–4",
+        "聚合或合併後依出錯物件核對欄位",
         "未定義落點 33",
         "場內熱區只畫 1–24 的 6×4 網格，出界另列統計",
         "先驗證代碼型別",
         "先用 `resolve_player()` 取得資料中的正式名稱",
         "回合長度以完整回合的事件列數計算",
-        "數值排序與比較先 `pd.to_numeric`",
-        "題目已指明空間對象時不反問另一種位置",
+        "數值排序或轉整數先 `pd.to_numeric(errors='coerce')`",
         "33 不從總樣本消失",
     ):
         assert rule in skill
@@ -152,39 +160,148 @@ def test_skill_joins_participating_rallies_before_counting_losses() -> None:
 
 def test_skill_preserves_one_pass_chart_and_failure_rules() -> None:
     skill = SKILL_PATH.read_text(encoding="utf-8")
-    assert "它不是 REPL，每次呼叫都須產生至少一個 artifact" in skill
-    assert "print 不算產物" in skill
-    assert "不要先用 print 探查再呼叫分析" in skill
-    assert "純資料概況優先用摘要／欄位工具" in skill
-    assert "已知欄位與口徑時不為了例行確認而列出全部欄位或場次" in skill
-    assert "在單次分析中輸出簡短摘要及所需互動 Plotly 圖" in skill
-    assert "多類別比較、趨勢或空間分布預設一張圖，無助理解才省略" in skill
-    assert "不為湊圖另呼叫工具" in skill
-    assert "需逐項精確數值時可輔以精簡表格" in skill
-    assert "不把不同單位硬塞同一座標軸" in skill
-    assert "聊天圖表不用 Matplotlib/PNG" in skill
-    assert "以最後一次成功回應為準" in skill
-    assert "`rich_ui_status=embedded` 或 `duplicate_suppressed` 表示圖已呈現" in skill
-    assert "狀態不明時不要盲目重畫" in skill
-    assert "不要另寫 `plotly_charts.json` 的 Markdown 圖片連結" in skill
+    assert "print-only stdout 可探查" in skill
+    assert "無 `result_id`、不可繪圖" in skill
+    assert "正式分析須保存 JSON／CSV／JSONL" in skill
+    assert "合計最多 4 KiB 預覽（標記截斷）" in skill
+    assert "純概況優先摘要／欄位工具" in skill
+    assert "renderAnalysisChart(result_id, code)" in skill
+    assert "多類別、趨勢、空間分布通常一圖，單值不強制" in skill
+    assert "只輸出 `plotly_charts.json`" in skill
+    assert "render 失敗只修圖不重算" in skill
+    assert "同訊息不重複成功請求，狀態不明不盲重畫" in skill
     assert "最多 3 次修正" in skill
     assert "502／503／504 屬基礎設施錯誤，不重試" in skill
     assert (
         "`analysis_retry_limit`、`analysis_message_limit` 或 `analysis_terminated`"
         in skill
     )
-    assert "sandbox 未安裝 SciPy" in skill
-    assert "預載 pandas/numpy 或標準函式庫" in skill
-    assert "不要臆測顯著性" in skill
+    assert "SciPy 未裝" in skill
+    assert "預載 `pd`、`np`" in skill
+    assert "勿臆測顯著性" in skill
     assert "全範圍勝負分析可用球員摘要交叉核對，但摘要不代替實際分析" in skill
 
 
 def test_prompt_prefers_useful_charts_and_result_first_answer() -> None:
     prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    assert "多類別、趨勢、空間分布通常配一圖，單值不強制" in prompt
+    assert "先說主要發現，再簡述口徑限制" in prompt
+
+
+def test_proxy_question_and_options_share_a_complete_plain_language_definition() -> (
+    None
+):
     skill = SKILL_PATH.read_text(encoding="utf-8")
-    assert (
-        "多類別比較、趨勢或空間分布預設一張互動圖，無助理解才省略；單值不強制" in prompt
+    prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    proxy_rule = next(line for line in skill.splitlines() if line.startswith("- 澄清"))
+    for concepts in (
+        ("question", "共用", "範圍", "球種", "分母"),
+        ("options", "白話", "必要定義", "差異", "直接分析"),
+        ("1–2", "實質不同", "自行定義", "合併"),
+        ("最貼題", "資料支持", "額外假設少", "先列"),
+        ("僅首項", "建議", "理由", "不預選"),
+        ("共用標示", "替代定義", "非核准", "意圖", "因果"),
+        ("確認前", "探索", "無合理 proxy", "限制", "可回答方向"),
+        ("選完", "不再問球種"),
+    ):
+        assert all(concept in proxy_rule for concept in concepts)
+    assert all(
+        concept in prompt
+        for concept in ("共用口徑", "白話短選項", "確認後", "無合理 proxy")
     )
-    assert "先說主要發現與意義，再呈圖表；口徑及限制簡述於後" in prompt
-    assert "先給可驗證結果及主要意義" in skill
-    assert "方法細節按需展開" in skill
+
+
+def test_clarification_example_keeps_player_direction_and_distinct_success_choices() -> (
+    None
+):
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    example = next(line for line in skill.splitlines() if line.startswith("- 例："))
+    question, options = example.split("options", 1)
+    assert all(
+        concept in question
+        for concept in ("周天成反手回擊後", "對手", "以殺球代表攻擊", "對手下一拍殺球")
+    )
+    assert "直接得分" in options and "最後贏下回合" in options
+    assert "自行指定" in options and "成功定義" in options
+    assert options.count("建議") == 1
+    assert all(
+        field not in example
+        for field in ("hit_area", "getpoint_player", "type ==", "÷")
+    )
+
+
+def test_explicit_definition_and_zero_samples_do_not_trigger_redefinition() -> None:
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    zero_rule = next(line for line in skill.splitlines() if "符合回合 0" in line)
+    assert all(
+        concept in zero_rule
+        for concept in ("明確定義", "零樣本", "勝率不可計", "不改定義", "追問湊樣本")
+    )
+    assert all(
+        concept in zero_rule for concept in ("替代分析", "可選後續", "不阻擋原題")
+    )
+    assert skill.index("使用者定義優先") < skill.index("- 澄清")
+    assert "核准口徑直接用" in skill
+    assert all(
+        concept in skill
+        for concept in ("欄位語義不明", "metadata", "Knowledge", "不請使用者猜 schema")
+    )
+    assert all(
+        concept in prompt
+        for concept in ("零樣本", "0", "勝率不可計", "不改口徑追問湊樣本")
+    )
+
+
+def test_skill_distinguishes_own_hit_sequence_and_segmented_reads() -> None:
+    import pandas as pd
+
+    skill = SKILL_PATH.read_text(encoding="utf-8")
+    sequence_rule = next(
+        line for line in skill.splitlines() if line.startswith("- 時序")
+    )
+    assert all(
+        term in sequence_rule
+        for term in (
+            "完整事件",
+            "同回合",
+            "該球員序列",
+            "hit_area",
+            "允許對手拍",
+            "不要求全體球序差 1",
+            "不可互代",
+            "回合鍵",
+        )
+    )
+    assert all(
+        term in skill
+        for term in (
+            "next_offset_bytes",
+            "offset_bytes",
+            "has_more",
+            "片段不是完整 JSON",
+            "read 成功不代表先前錯誤已解決",
+            "不能憑零值宣稱驗證成功",
+        )
+    )
+    # 依 Skill 的自身序列口徑，中間有對手事件仍是相鄰兩次自身擊球。
+    events = pd.DataFrame(
+        [
+            {"rally": 1, "ball_round": "3.0", "player": "P", "hit_area": "21.0"},
+            {"rally": 1, "ball_round": "2.0", "player": "O", "hit_area": "14.0"},
+            {"rally": 1, "ball_round": "1.0", "player": "P", "hit_area": "1.0"},
+            {"rally": 2, "ball_round": "1.0", "player": "P", "hit_area": "4.0"},
+        ]
+    )
+    ordered = events.assign(
+        ball_round=pd.to_numeric(events.ball_round),
+        hit_area=pd.to_numeric(events.hit_area),
+    ).sort_values(["rally", "ball_round"])
+    own = ordered.loc[ordered.player == "P"]
+    previous = own.groupby("rally").hit_area.shift()
+    qualifying = (
+        own.hit_area.isin([1, 4, 21, 24])
+        & previous.isin([1, 4, 21, 24])
+        & (own.hit_area != previous)
+    )
+    assert qualifying.sum() == 1

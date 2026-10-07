@@ -8,7 +8,7 @@ BadmintonAI 讓使用者用自然語言分析羽球逐拍資料。Open WebUI 提
 - 對必要的名詞或計算口徑先查核；資訊不足且會改變結果時，向使用者澄清。
 - 支援自訂 Python 分析與互動式 Plotly 圖表，圖表可直接顯示在聊天室。
 - 管理員可從專案附帶的 100 題題庫選題執行評測、檢視原始對話及匯出報告。
-- 可將已匯出的 Open WebUI 對話轉成離線 HTML；另有靜態 PDF 匯出工具。
+- 可從聊天列表的「⋯ → 下載」下載完整對話的互動 HTML 或 PDF；評測工作台也可直接下載 PDF。
 
 ## 開始使用
 
@@ -56,7 +56,7 @@ python -m pytest -q
 python scripts/export_chat_html.py conversation.json conversation.html --theme light
 ```
 
-HTML 匯出不會重新執行模型或分析。PDF 使用獨立的靜態匯出工具。
+HTML 匯出不會重新執行模型或分析。Open WebUI 原生聊天列表選單提供 PDF 與互動 HTML 下載；伺服器依登入者的匯出權限及對話擁有權讀取已儲存的完整目前分支。兩種輸出共用安全 HTML builder 與 Open WebUI 映像內的 Chromium；PDF 會等候字型和 Plotly 圖表完成。舊 JSON→手繪 PDF 腳本已移除，JSON 匯出與 JSON→HTML 工具仍保留。
 
 ## 安全與限制
 
@@ -64,4 +64,4 @@ HTML 匯出不會重新執行模型或分析。PDF 使用獨立的靜態匯出�
 
 ## 授權
 
-程式碼依 MIT 授權；授權全文位於儲存庫根目錄的 `LICENSE`。
+本專案自行撰寫程式依 MIT 授權；授權全文位於儲存庫根目錄的 `LICENSE`。自訂 Open WebUI 映像以 v0.11.3 上游來源建置，並保留該版本隨附的授權與聲明檔。

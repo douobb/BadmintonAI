@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
+import hashlib
 import importlib.resources
 import json
 import logging
 import os
+import re
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -42,12 +43,14 @@ from ..sandbox import (
     SandboxArtifactError,
     SandboxCodeError,
     SandboxExecutionError,
+    SandboxInputFile,
     SandboxMaterializationError,
     SandboxOutputError,
     SandboxPolicyError,
     SandboxResult,
     SandboxTimeoutError,
     SandboxUnavailableError,
+    sandbox_code_error_message,
 )
 from .chart_display import (
     OpenWebUIBridgeError,
@@ -56,7 +59,6 @@ from .chart_display import (
     OpenWebUIEventOutcomeUnknown,
     OpenWebUIIdentityMismatch,
 )
-from .chart_spec import CHART_SPEC_FILE
 from .composition import CompositionError, ToolServices, build_services
 from .plotly_rich import (
     DEFAULT_PLOTLY_ASSET_URL,
@@ -68,13 +70,24 @@ from .plotly_rich import (
     render_plotly_charts_html,
     validate_plotly_asset_url,
 )
+from .result_store import (
+    AnalysisResultExpired,
+    AnalysisResultNotFound,
+    AnalysisResultOutputError,
+    AnalysisResultScope,
+    AnalysisResultStore,
+    AnalysisResultStoreUnavailable,
+    StoredAnalysisResult,
+)
 
 ACCESS_LOGGER = logging.getLogger("uvicorn.error.badminton_ai")
 
 SERVER_VERSION = "0.1.0"
 MAX_ANALYSIS_CODE_CHARS = 64 * 1024
 MAX_ARTIFACT_TEXT_PREVIEW_BYTES = 16 * 1024
-TEXT_ARTIFACT_EXTENSIONS = frozenset({".csv", ".json", ".jsonl"})
+MAX_ANALYSIS_TEXT_PREVIEW_BYTES = 4 * 1024
+MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES = 4 * 1024
+_OPENWEBUI_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 MAX_ANALYSIS_FAILURES_PER_MESSAGE = 4
 MAX_ANALYSIS_RUNS_PER_MESSAGE = 12
 MAX_TRACKED_ANALYSIS_MESSAGES = 2048
@@ -208,28 +221,49 @@ class AnalysisRequest(BaseModel):
             "在隔離 Docker 沙箱執行 Python。已預載完整、未篩選的事件 df（保留來源列序、"
             "欄位順序、空字串與 null）、pd、np、plt、json、os、Path、resolve_player。"
             "球員別名先用 resolve_player('周天成') 轉為 df 中的正式名稱再篩選。"
-            "必要口徑未確認前不要呼叫本工具；欄位探查先用 listColumnCatalog，"
-            "不得以 Python 探查。正式分析時再核對 df.columns 或 "
-            "BADMINTON_SCHEMA_FILE，不猜欄名或覆寫原始 df。"
+            "預載名稱不限 import；pandas/numpy/matplotlib/plotly 已安裝；"
+            "標準庫可 import，SciPy 未裝（Spearman corr 需）。澄清前可用 Python 探查／部分分析，"
+            "未確認必要口徑不作結論。核對 df.columns 或 "
+            "BADMINTON_SCHEMA_FILE；不猜欄名、不覆寫 df。"
             "可讀 BADMINTON_EVENTS_FILE、BADMINTON_MANIFEST_FILE、"
-            "BADMINTON_METADATA_FILE、BADMINTON_SCHEMA_FILE。"
-            "本工具不是 REPL；不要先以 print 探查再另呼叫分析。"
-            "每次須在 BADMINTON_OUTPUT_DIR 輸出至少一個檔案，print 不算產物；"
+            "BADMINTON_METADATA_FILE。"
+            "正式結果須在 BADMINTON_OUTPUT_DIR 保存至少一個檔案；短小 print-only 探查可回傳最多 4 KiB stdout，但沒有 result_id、不可繪圖。"
             "它是環境變數，不是 Python 名稱：out = Path(os.environ['BADMINTON_OUTPUT_DIR'])。"
-            "文字摘要建議用 summary.json。"
-            "圖表可選且不受固定模板限制：聊天圖表只能用 Plotly，"
-            "預載的 plt/Matplotlib 產生的 PNG 不會顯示於聊天。需要互動圖時同次輸出根目錄 "
-            "plotly_charts.json，其最外層恰為 schema_version='badminton-plotly/v1' "
-            "與 charts（1–4 個）；每個 chart 含 title 與 Plotly figure JSON，"
-            "可用 figure=json.loads(fig.to_json())。不可交回 figure JSON 字串、HTML 或 PNG "
-            "作聊天圖表；圖表與摘要須使用相同的已核對資料。"
-            "篩選結果為零時不得放寬確認條件湊非零；只輸出摘要，不輸出圖表。"
-            "圖已嵌入時直接描述，不要另寫 plotly_charts.json 的 Markdown 連結。"
+            "小型 JSON、CSV、JSONL 產物會回傳有限文字預覽，不須指定檔名。"
+            "此工具只分析並保存可重用的 JSON、CSV 或 JSONL；"
+            "不要輸出圖表。互動圖稍後由 renderAnalysisChart 從已保存檔案產生，"
+            "不要在後續繪圖時重新查詢原始資料或把完整資料塞入工具參數。"
         ),
     )
 
 
-class ArtifactResponse(BaseModel):
+class RenderAnalysisRequest(BaseModel):
+    """依同一 chat 的保存結果產生互動圖，不接觸原始資料 snapshot。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_id: Annotated[
+        str,
+        StringConstraints(pattern=r"^[a-f0-9]{48}$", min_length=48, max_length=48),
+    ]
+    code: str = Field(
+        min_length=1,
+        max_length=MAX_ANALYSIS_CODE_CHARS,
+        description=(
+            "在隔離 Docker 繪圖 sandbox 執行 Python；沒有 df、原始 events、metadata 或 "
+            "resolve_player。唯讀使用預載 results_dir（包含此 result_id 的保存 CSV/JSON/JSONL）、"
+            "pd、np、json、Path 與 output_dir；繪圖端可 import 已安裝的 Plotly。依本工具列出的檔名"
+            "自行讀取與整理；不要假設未保存欄位或另查 snapshot。"
+            "使用 Path(output_dir / 'plotly_charts.json') 在根目錄只寫該檔，格式恰為 "
+            "schema_version='badminton-plotly/v1' 與 charts（1–4 個），每個 chart 含 title "
+            "與 Plotly figure JSON（例如 json.loads(fig.to_json())）。不輸出 PNG、HTML 或其他檔案。"
+        ),
+    )
+
+
+class AnalysisFileResponse(BaseModel):
+    """不把完整保存資料回傳給模型的簡短檔案描述。"""
+
     model_config = ConfigDict(extra="forbid")
 
     relative_path: str
@@ -237,93 +271,76 @@ class ArtifactResponse(BaseModel):
     extension: str
     mime_type: str
     size_bytes: int
-    content_base64: str | None = Field(
-        default=None,
-        description=(
-            "一般文字 artifact 保留原始位元組 base64；plotly_charts.json 是伺服器消費的"
-            " Rich UI 控制檔，不回傳給模型。PNG 不會附加或回傳 base64。"
-        ),
-    )
-    chart_display_status: Literal[
-        "not_applicable",
-        "attached",
-        "rendered_as_rich_ui",
-        "invalid_png",
-        "bridge_not_configured",
-        "chat_context_missing",
-        "identity_mismatch",
-        "attachment_failed",
-        "attachment_unknown",
-    ] = Field(
-        default="not_applicable",
-        description=("保留舊版回應欄位供相容；新分析不附加 PNG。"),
-    )
-    text_preview: str | None = Field(
-        default=None,
-        description=(
-            "僅 UTF-8 .json、.jsonl、.csv 產物提供，最多 16 KiB UTF-8；"
-            "其他格式或無效 UTF-8 為 null。答案只能依可見內容作答；"
-            "若 preview_truncated 為 true，請要求產生更精簡摘要，"
-            "不得猜測預覽未顯示的類別、資料列或數值。"
-        ),
-    )
-    preview_truncated: bool = Field(
-        default=False,
-        description=(
-            "文字預覽是否超過 16 KiB 上限而被截斷。true 代表內容不完整；"
-            "請要求更精簡摘要，不得推測被截斷部分的類別、資料列或數值。"
-        ),
-    )
+    text_preview: str | None = None
+    preview_truncated: bool = False
+    preview_offset_bytes: int | None = None
+    next_offset_bytes: int | None = None
+    has_more: bool | None = None
+
+
+class ReadAnalysisResultResponse(BaseModel):
+    """從同一 user/chat 讀取已保存檔案的有限文字預覽。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_id: str
+    artifacts: list[AnalysisFileResponse]
 
 
 class AnalysisResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    result_id: str | None = Field(
+        default=None,
+        description="有保存可重用 artifact 時提供；stdout-only 探查沒有 result_id，不可繪圖",
+    )
+    result_fingerprint: str | None = Field(
+        default=None,
+        description="Tool Server 對已保存資料檔內容計算的 SHA-256 識別；不包含資料本文",
+    )
+    analysis_runs_remaining: int | None = Field(
+        default=None,
+        ge=0,
+        le=MAX_ANALYSIS_RUNS_PER_MESSAGE,
+        description="此 assistant 訊息尚可執行的分析次數；只供回合收尾控制，不代表分析完整性",
+    )
     job_id: str
     exit_code: int
     snapshot_id: str
     source: str
     row_count: int
     columns: list[str]
-    rich_ui_status: Literal[
-        "not_requested",
-        "embedded",
-        "duplicate_suppressed",
-        "invalid_spec",
-        "bridge_not_configured",
-        "chat_context_missing",
-        "identity_mismatch",
-        "embed_failed",
-        "embed_unknown",
-    ] = Field(
-        default="not_requested",
+    artifacts: list[AnalysisFileResponse] = Field(
         description=(
-            "Plotly Rich UI 狀態。embedded 代表通用 renderer 已持久附加；"
-            "duplicate_suppressed 代表此訊息已有語意完全相同的圖，沿用既有圖；"
-            "invalid_spec 時依 rich_ui_error 修正契約後再試；沒有 PNG 備援。"
-        ),
-    )
-    rich_ui_error: str | None = Field(
-        default=None,
-        max_length=200,
-        description=(
-            "Rich UI 驗證或嵌入失敗時的安全短訊息；成功或未要求 Rich UI 時為 null。"
-            "不包含 chart spec 原文、HTML、圖表資料值或私密路徑。"
-        ),
-    )
-    artifacts: list[ArtifactResponse] = Field(
-        description=(
-            "一般文字 artifact 保留原始 content_base64；plotly_charts.json 由伺服器消費"
-            "且不列在回應內。JSON、JSONL、CSV 另提供有上限的 text_preview。"
-            "PNG 不會附加或回傳；只有 rich_ui_status=embedded 或 duplicate_suppressed"
-            " 才能聲稱圖表已顯示。回答數值只能依"
-            "可見且未截斷的文字預覽；若已截斷，應要求更精簡摘要，不得猜測缺失類別或數值。"
+            "relative_path 是可供繪圖使用的真實保存檔名；完整 CSV/JSON/JSONL 留在 user/chat 綁定的 result_id 中，不回傳 base64 或整份資料。"
+            "小型 JSON、CSV、JSONL 可提供最多 4 KiB UTF-8 文字預覽；完整檔案仍留在保存區。"
+            "單次回應內所有檔案共用 4 KiB 預覽額度；額度用完後後續預覽為 null 並標記截斷。"
+            "大型內容只回傳截斷預覽與標記，不回傳 Base64 或完整資料。"
         )
     )
+    stdout_preview: str | None = Field(
+        default=None,
+        description="只有沒有 artifact 的 stdout-only 探查會回傳，最多 4 KiB UTF-8，不能供繪圖重用",
+    )
+    stdout_preview_truncated: bool = False
+
+
+class RenderAnalysisResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["embedded", "duplicate_suppressed"] = Field(
+        description=(
+            "embedded 表示圖已發布；duplicate_suppressed 表示同一 assistant 訊息已有圖，"
+            "兩者都應停止重複呼叫並交付。"
+        )
+    )
+    result_id: str = Field(description="本次發布或同訊息既有圖表所使用的分析結果識別碼")
+    chart_count: int = Field(ge=1, le=4)
 
 
 ERROR_RESPONSES = {
     400: {"model": ErrorResponse},
+    403: {"model": ErrorResponse},
     409: {"model": ErrorResponse},
     404: {"model": ErrorResponse},
     422: {"model": ErrorResponse},
@@ -332,6 +349,7 @@ ERROR_RESPONSES = {
     502: {"model": ErrorResponse},
     503: {"model": ErrorResponse},
     504: {"model": ErrorResponse},
+    410: {"model": ErrorResponse},
 }
 
 
@@ -358,6 +376,14 @@ def create_app(
         except DataError:
             services = None
     application.state.tool_services = services
+    result_store = services.analysis_results if services is not None else None
+    if result_store is None:
+        result_store_tempdir = tempfile.TemporaryDirectory(
+            prefix="badminton-ai-analysis-results-"
+        )
+        application.state.result_store_tempdir = result_store_tempdir
+        result_store = AnalysisResultStore(result_store_tempdir.name)
+    application.state.analysis_result_store = result_store
     application.state.chart_bridge = chart_bridge or OpenWebUIChartBridge(
         base_url=os.environ.get("BADMINTON_AI_OPEN_WEBUI_URL"),
         api_key=os.environ.get("BADMINTON_AI_OPEN_WEBUI_API_KEY"),
@@ -371,8 +397,6 @@ def create_app(
     application.state.analysis_failures = OrderedDict()
     application.state.analysis_attempts_lock = Lock()
     application.state.terminal_analysis_messages = set()
-    application.state.uncertain_embeds = set()
-    application.state.completed_embeds = set()
 
     @application.middleware("http")
     async def trace_request(request: Request, call_next):
@@ -465,9 +489,11 @@ def create_app(
         operation_id="requestClarification",
         summary="要求使用者澄清必要的分析條件",
         description=(
-            "只有缺少會實質改變答案、且沒有已核准預設的必要條件時才呼叫。"
-            "question 是要向使用者顯示的簡短問題；options 可留空或提供最多三個選項。"
-            "本工具只回報等待補答，不執行資料分析；呼叫後請直接呈現問題並停止本輪分析。"
+            "缺漏必要口徑會改變答案且無核准預設才呼叫。question 共用說明範圍、球種與分母，"
+            "options 用白話短句呈現不同定義及自行定義，合起來須可直接分析；最多三項。"
+            "最貼題且資料支持者先列，僅首項標建議；無合理 proxy 則說明限制。"
+            "可先以 Python 探查或做不依賴該口徑的部分分析，但不得把未確認定義當最終結論。"
+            "明確口徑下零樣本直接交付，不為改口徑湊樣本澄清。本工具只回報等待補答，不分析資料。"
         ),
         response_model=ClarificationResponse,
         responses=ERROR_RESPONSES,
@@ -588,10 +614,12 @@ def create_app(
     @application.post(
         "/tools/analyze",
         operation_id="runPythonAnalysis",
-        summary="在 Docker sandbox 執行自訂 Python 分析",
+        summary="在 Docker sandbox 分析並保存可重用資料",
         description=(
-            "將完整資料快照、metadata/schema 與程式交給 Docker 沙箱；"
-            "API 程序不直接執行程式碼。輸入與圖表格式見 code 欄位說明。"
+            "將完整資料快照、metadata/schema 與程式交給 Docker 沙箱，將 JSON/CSV 類產物"
+            "保存於同一 user/chat 可存取的短期結果空間；回傳 result_id 及實際檔名，不嵌入圖表。"
+            "僅探查且沒有檔案時，可回傳最多 4 KiB stdout preview，但不建立 result_id，不能繪圖。"
+            "互動圖需另呼叫 renderAnalysisChart。API 程序不直接執行程式碼。"
         ),
         response_model=AnalysisResponse,
         responses=ERROR_RESPONSES,
@@ -601,26 +629,30 @@ def create_app(
         http_request: Request,
     ) -> AnalysisResponse | JSONResponse:
         tool_services = _services(application)
+        scope = _analysis_result_scope(http_request)
+        if scope is None:
+            return _error_response(
+                400,
+                "chat_context_missing",
+                "缺少有效 Open WebUI 使用者與聊天室識別資訊",
+            )
         message_key = _analysis_message_key(http_request)
+        analysis_runs_remaining: int | None = None
         if message_key is not None:
             with application.state.analysis_attempts_lock:
-                if message_key in application.state.uncertain_embeds:
-                    return _error_response(
-                        409,
-                        "chart_state_unknown",
-                        "先前圖表嵌入狀態無法確認；請重新載入對話確認後再要求重試",
-                    )
-                if message_key in application.state.completed_embeds:
-                    return _error_response(
-                        409,
-                        "chart_already_embedded",
-                        "本則回答已有互動圖表；請沿用既有圖，不要重複執行分析",
-                    )
                 if message_key in application.state.terminal_analysis_messages:
                     return _error_response(
                         409,
                         "analysis_terminated",
                         "本則回答的分析已因基礎設施錯誤終止；請停止工具呼叫並說明分析未完成",
+                        {
+                            "terminal": True,
+                            "analysis_runs_remaining": max(
+                                0,
+                                MAX_ANALYSIS_RUNS_PER_MESSAGE
+                                - application.state.analysis_runs.get(message_key, 0),
+                            ),
+                        },
                     )
                 failures = application.state.analysis_failures
                 current_failures = failures.get(message_key, 0)
@@ -633,6 +665,11 @@ def create_app(
                             "failed_attempts": current_failures,
                             "max_failed_attempts": MAX_ANALYSIS_FAILURES_PER_MESSAGE,
                             "terminal": True,
+                            "analysis_runs_remaining": max(
+                                0,
+                                MAX_ANALYSIS_RUNS_PER_MESSAGE
+                                - application.state.analysis_runs.get(message_key, 0),
+                            ),
                         },
                     )
                 runs = application.state.analysis_runs
@@ -646,57 +683,479 @@ def create_app(
                             "runs": current_runs,
                             "max_runs": MAX_ANALYSIS_RUNS_PER_MESSAGE,
                             "terminal": True,
+                            "analysis_runs_remaining": 0,
                         },
                     )
                 runs[message_key] = current_runs + 1
+                analysis_runs_remaining = max(
+                    0,
+                    MAX_ANALYSIS_RUNS_PER_MESSAGE - runs[message_key],
+                )
                 runs.move_to_end(message_key)
                 if len(runs) > MAX_TRACKED_ANALYSIS_MESSAGES:
                     old_key, _ = runs.popitem(last=False)
                     application.state.analysis_failures.pop(old_key, None)
                     application.state.terminal_analysis_messages.discard(old_key)
-                    application.state.uncertain_embeds.discard(old_key)
-                    application.state.completed_embeds.discard(old_key)
         try:
             result = tool_services.sandbox.run(tool_services.query, request.code)
+            if not result.artifacts:
+                preview, _ = _bounded_stdout_preview(result)
+                if preview is None:
+                    raise SandboxOutputError("sandbox 必須產生至少一個 artifact")
         except DataError as exc:
             status, code, message = _map_domain_error(exc)
+            remaining_details = (
+                {"analysis_runs_remaining": analysis_runs_remaining}
+                if analysis_runs_remaining is not None
+                else {}
+            )
             if message_key is not None:
                 with application.state.analysis_attempts_lock:
                     if status in {502, 503, 504}:
                         application.state.terminal_analysis_messages.add(message_key)
-                    elif isinstance(exc, (SandboxCodeError, SandboxOutputError)):
+                    elif isinstance(
+                        exc,
+                        (
+                            SandboxCodeError,
+                            SandboxOutputError,
+                            AnalysisResultOutputError,
+                        ),
+                    ):
                         failures = application.state.analysis_failures
                         failures[message_key] = failures.get(message_key, 0) + 1
                 if status in {502, 503, 504}:
+                    remaining_details["terminal"] = True
                     return _error_response(
                         status,
                         code,
                         message,
-                        {"terminal": True},
+                        remaining_details,
                     )
-            raise
+            return _error_response(
+                status,
+                code,
+                message,
+                remaining_details or None,
+            )
+        stored_result: StoredAnalysisResult | None = None
+        if result.artifacts:
+            try:
+                stored_result = application.state.analysis_result_store.save(
+                    scope=scope,
+                    snapshot_id=result.manifest.snapshot_id,
+                    artifacts=result.artifacts,
+                )
+            except DataError as exc:
+                status, code, message = _map_domain_error(exc)
+                remaining_details = (
+                    {"analysis_runs_remaining": analysis_runs_remaining}
+                    if analysis_runs_remaining is not None
+                    else {}
+                )
+                if message_key is not None:
+                    with application.state.analysis_attempts_lock:
+                        if status in {502, 503, 504}:
+                            application.state.terminal_analysis_messages.add(
+                                message_key
+                            )
+                        elif isinstance(exc, AnalysisResultOutputError):
+                            failures = application.state.analysis_failures
+                            failures[message_key] = failures.get(message_key, 0) + 1
+                if status in {502, 503, 504}:
+                    remaining_details["terminal"] = True
+                return _error_response(
+                    status,
+                    code,
+                    message,
+                    remaining_details or None,
+                )
         response = _analysis_response(
             result,
-            chart_bridge=application.state.chart_bridge,
-            chat_id=http_request.headers.get("X-OpenWebUI-Chat-Id"),
-            message_id=http_request.headers.get("X-OpenWebUI-Message-Id"),
-            user_id=http_request.headers.get("X-OpenWebUI-User-Id"),
-            plotly_asset_url=application.state.plotly_asset_url,
+            stored_result,
+            analysis_runs_remaining=analysis_runs_remaining,
         )
-        if message_key is not None:
+        if message_key is not None and stored_result is not None:
             with application.state.analysis_attempts_lock:
-                if response.rich_ui_status == "embed_unknown":
-                    application.state.uncertain_embeds.add(message_key)
-                elif response.rich_ui_status in {"embedded", "duplicate_suppressed"}:
-                    application.state.completed_embeds.add(message_key)
-                if response.rich_ui_status == "invalid_spec":
-                    failures = application.state.analysis_failures
-                    failures[message_key] = failures.get(message_key, 0) + 1
-                else:
-                    application.state.analysis_failures.pop(message_key, None)
+                application.state.analysis_failures.pop(message_key, None)
         return response
 
+    @application.get(
+        "/tools/analysis-result",
+        operation_id="readAnalysisResult",
+        summary="唯讀查看已保存分析結果",
+        description=(
+            "依同一 user/chat 的 result_id 讀取已保存檔名與最多 4 KiB UTF-8 預覽，"
+            "可用 relative_path 精確選取單一檔案，offset_bytes 預設 0；有 has_more 時以 next_offset_bytes 讀下一段。"
+            "位置均為 UTF-8 bytes，片段不代表完整 JSON；"
+            "此工具不執行 Python、不查詢原始 snapshot、不繪圖，也不扣分析額度。"
+        ),
+        response_model=ReadAnalysisResultResponse,
+        responses=ERROR_RESPONSES,
+    )
+    async def read_analysis_result(
+        http_request: Request,
+        result_id: str = Query(
+            ...,
+            min_length=48,
+            max_length=48,
+            pattern=r"^[a-f0-9]{48}$",
+            description="先前 runPythonAnalysis 回傳的 opaque result_id。",
+        ),
+        relative_path: str | None = Query(
+            default=None,
+            min_length=1,
+            max_length=512,
+            description="可選，精確保存檔名；不接受路徑模式或路徑正規化。",
+        ),
+        offset_bytes: str | None = Query(
+            default=None,
+            max_length=20,
+            pattern=r"^(0|[1-9][0-9]*)$",
+            description="僅指定 relative_path 時可用，UTF-8 byte 起點；使用上段 next_offset_bytes，不是字元索引。",
+        ),
+    ) -> ReadAnalysisResultResponse | JSONResponse:
+        scope = _analysis_result_scope(http_request)
+        if scope is None:
+            return _error_response(
+                400,
+                "chat_context_missing",
+                "缺少有效 Open WebUI 使用者與聊天室識別資訊",
+            )
+        store: AnalysisResultStore = http_request.app.state.analysis_result_store
+        try:
+            stored = store.get(result_id, scope=scope)
+        except DataError as exc:
+            status, code, message = _map_domain_error(exc)
+            return _error_response(status, code, message)
+
+        files = stored.files
+        if relative_path is not None:
+            files = tuple(item for item in files if item.relative_path == relative_path)
+            if not files:
+                return _error_response(
+                    404,
+                    "analysis_result_file_not_found",
+                    "找不到此保存結果中的指定檔案",
+                )
+        if relative_path is None and offset_bytes is not None:
+            return _error_response(
+                400, "analysis_result_offset_invalid", "分段讀取需指定保存檔名"
+            )
+        if relative_path is not None:
+            try:
+                artifacts = [_analysis_file_segment(files[0], int(offset_bytes or "0"))]
+            except ValueError:
+                return _error_response(
+                    400,
+                    "analysis_result_offset_invalid",
+                    "讀取位置超界、非 UTF-8 邊界或保存文字編碼無效",
+                )
+        else:
+            artifacts = _analysis_file_responses(files)
+        return ReadAnalysisResultResponse(
+            result_id=stored.result_id,
+            artifacts=artifacts,
+        )
+
+    @application.post(
+        "/tools/render-chart",
+        operation_id="renderAnalysisChart",
+        summary="從保存的分析結果繪製並嵌入互動圖",
+        description=(
+            "以 result_id 讀取同一 user/chat 的短期保存 JSON/CSV，將唯讀檔案交給 Docker 繪圖模式；"
+            "不查詢原始資料 snapshot。繪圖 sandbox 僅輸出 Plotly JSON，由 Tool Server 驗證後"
+            "透過既有 Rich UI 寫回本 assistant 訊息；失敗可只修正繪圖程式。"
+            "embedded 與 duplicate_suppressed 都代表同訊息圖表已發布；duplicate_suppressed 時勿再呼叫 render，直接交付。"
+        ),
+        response_model=RenderAnalysisResponse,
+        responses=ERROR_RESPONSES,
+    )
+    async def render_analysis_chart(
+        request: RenderAnalysisRequest,
+        http_request: Request,
+    ) -> RenderAnalysisResponse | JSONResponse:
+        services = _services(application)
+        scope = _analysis_result_scope(http_request)
+        message_id = http_request.headers.get("X-OpenWebUI-Message-Id")
+        if (
+            scope is None
+            or not isinstance(message_id, str)
+            or _OPENWEBUI_ID_PATTERN.fullmatch(message_id) is None
+        ):
+            return _error_response(
+                400,
+                "chat_context_missing",
+                "繪圖需要有效 Open WebUI 使用者、聊天室與 assistant 訊息識別資訊",
+            )
+        store: AnalysisResultStore = application.state.analysis_result_store
+        try:
+            stored = store.get(request.result_id, scope=scope)
+            claim = store.begin_render(
+                request.result_id,
+                scope=scope,
+                message_id=message_id,
+            )
+        except DataError as exc:
+            status, code, message = _map_domain_error(exc)
+            return _error_response(status, code, message)
+
+        if claim.status == "completed":
+            if claim.result_id is None:
+                return _error_response(
+                    409,
+                    "chart_state_unknown",
+                    "既有圖表使用的分析結果無法確認；請先查看原對話，避免重複發布",
+                    {"terminal": True},
+                )
+            return RenderAnalysisResponse(
+                status="duplicate_suppressed",
+                result_id=claim.result_id,
+                chart_count=max(1, claim.chart_count or 1),
+            )
+        if claim.status in {"unknown", "terminal", "busy", "limit"}:
+            status, code, message = {
+                "unknown": (
+                    409,
+                    "chart_state_unknown",
+                    "先前繪圖或嵌入狀態無法確認；請先檢查原對話，不要盲目重送",
+                ),
+                "terminal": (
+                    409,
+                    "render_terminated",
+                    "本則訊息的繪圖已因基礎設施錯誤終止；請停止重試並說明未完成",
+                ),
+                "busy": (409, "render_in_progress", "本則訊息已有繪圖正在執行"),
+                "limit": (
+                    429,
+                    "render_retry_limit",
+                    "本則訊息的繪圖修正次數已達上限；請停止重試",
+                ),
+            }[claim.status]
+            return _error_response(
+                status,
+                code,
+                message,
+                {"terminal": claim.status != "busy", "attempts": claim.attempts},
+            )
+
+        try:
+            rendered = services.sandbox.run_render(
+                tuple(
+                    SandboxInputFile(item.relative_path, item.content)
+                    for item in stored.files
+                ),
+                snapshot_id=stored.snapshot_id,
+                code=request.code,
+            )
+        except DataError as exc:
+            status, code, message = _map_render_error(exc)
+            try:
+                store.finish_render(
+                    scope=scope,
+                    message_id=message_id,
+                    status="terminal" if status in {502, 503, 504} else "failed",
+                )
+            except DataError:
+                pass
+            return _error_response(
+                status,
+                code,
+                message,
+                {
+                    "terminal": status in {502, 503, 504},
+                    "attempt": claim.attempts,
+                    "max_attempts": MAX_ANALYSIS_FAILURES_PER_MESSAGE,
+                    **(
+                        {
+                            "available_files": [
+                                item.relative_path for item in stored.files
+                            ]
+                        }
+                        if isinstance(exc, SandboxCodeError)
+                        and exc.hint == "missing_file"
+                        else {}
+                    ),
+                },
+            )
+
+        chart_artifacts = [
+            item
+            for item in rendered.artifacts
+            if item.relative_path == PLOTLY_CHARTS_FILE
+        ]
+        if len(chart_artifacts) != 1 or len(rendered.artifacts) != 1:
+            return _finish_render_error(
+                store,
+                scope=scope,
+                message_id=message_id,
+                status_code=422,
+                code="render_output_error",
+                message="繪圖只可輸出根目錄 plotly_charts.json，不可輸出其他檔案",
+                attempt=claim.attempts,
+                result_id=request.result_id,
+            )
+        try:
+            charts = parse_plotly_charts_artifact(chart_artifacts[0])
+            if _stored_json_reports_zero_events(stored):
+                raise PlotlySpecError("來源摘要表示沒有符合條件的事件")
+            rich_html = render_plotly_charts_html(
+                charts,
+                asset_url=application.state.plotly_asset_url,
+            )
+        except (PlotlySpecError, ValueError) as exc:
+            detail = (
+                str(exc)[:200]
+                if isinstance(exc, PlotlySpecError)
+                else "Plotly 本機資產 URL 設定無效"
+            )
+            return _finish_render_error(
+                store,
+                scope=scope,
+                message_id=message_id,
+                status_code=422,
+                code="render_invalid_spec",
+                message=f"Plotly 圖表格式無效：{detail}",
+                attempt=claim.attempts,
+                result_id=request.result_id,
+            )
+
+        rich_status, rich_error = _emit_rich_ui(
+            rich_html,
+            chart_bridge=application.state.chart_bridge,
+            chat_id=scope.chat_id,
+            message_id=message_id,
+            user_id=scope.user_id,
+        )
+        if rich_status in {"embedded", "duplicate_suppressed"}:
+            try:
+                store.finish_render(
+                    scope=scope,
+                    message_id=message_id,
+                    status="completed",
+                    chart_count=len(charts.charts),
+                )
+            except DataError:
+                return _error_response(
+                    503,
+                    "render_state_unavailable",
+                    "圖表已送出但保存完成狀態失敗；請檢查原對話，不要盲目重送",
+                    {"terminal": True},
+                )
+            return RenderAnalysisResponse(
+                status=rich_status,
+                result_id=request.result_id,
+                chart_count=len(charts.charts),
+            )
+        if rich_status == "embed_unknown":
+            terminal_state = "unknown"
+            status_code, error_code = 409, "chart_state_unknown"
+        elif rich_status == "bridge_not_configured":
+            terminal_state = "terminal"
+            status_code, error_code = 503, "chart_bridge_unavailable"
+        elif rich_status == "identity_mismatch":
+            terminal_state = "terminal"
+            status_code, error_code = 403, "chart_identity_mismatch"
+        else:
+            terminal_state = "terminal"
+            status_code, error_code = 502, "chart_embed_failed"
+        try:
+            store.finish_render(
+                scope=scope,
+                message_id=message_id,
+                status=terminal_state,
+            )
+        except DataError:
+            terminal_state = "unknown"
+        return _error_response(
+            status_code,
+            error_code,
+            rich_error or "Rich UI 圖表嵌入失敗",
+            {"terminal": terminal_state in {"unknown", "terminal"}},
+        )
+
     return application
+
+
+def _analysis_result_scope(request: Request) -> AnalysisResultScope | None:
+    user_id = request.headers.get("X-OpenWebUI-User-Id")
+    chat_id = request.headers.get("X-OpenWebUI-Chat-Id")
+    if (
+        not isinstance(user_id, str)
+        or _OPENWEBUI_ID_PATTERN.fullmatch(user_id) is None
+        or not isinstance(chat_id, str)
+        or _OPENWEBUI_ID_PATTERN.fullmatch(chat_id) is None
+    ):
+        return None
+    try:
+        return AnalysisResultScope(user_id=user_id, chat_id=chat_id)
+    except ValueError:
+        return None
+
+
+def _map_render_error(exc: DataError) -> tuple[int, str, str]:
+    if isinstance(exc, SandboxCodeError):
+        return 422, "render_code_error", sandbox_code_error_message(exc)
+    if isinstance(exc, SandboxOutputError):
+        return (
+            422,
+            "render_output_error",
+            "繪圖程式輸出不符合契約；只輸出根目錄 plotly_charts.json",
+        )
+    status, code, message = _map_domain_error(exc)
+    return status, f"render_{code}", message
+
+
+def _finish_render_error(
+    store: AnalysisResultStore,
+    *,
+    scope: AnalysisResultScope,
+    message_id: str,
+    status_code: int,
+    code: str,
+    message: str,
+    attempt: int,
+    result_id: str,
+) -> JSONResponse:
+    try:
+        store.finish_render(
+            scope=scope,
+            message_id=message_id,
+            status="failed",
+        )
+    except DataError:
+        return _error_response(
+            503,
+            "render_state_unavailable",
+            "繪圖狀態無法保存；請先檢查原對話再處理",
+            {"terminal": True},
+        )
+    return _error_response(
+        status_code,
+        code,
+        message,
+        {
+            "terminal": False,
+            "attempt": attempt,
+            "max_attempts": MAX_ANALYSIS_FAILURES_PER_MESSAGE,
+            "result_id": result_id,
+        },
+    )
+
+
+def _stored_json_reports_zero_events(result: StoredAnalysisResult) -> bool:
+    for artifact in result.files:
+        if (
+            artifact.extension != ".json"
+            or artifact.size_bytes > MAX_ARTIFACT_TEXT_PREVIEW_BYTES
+        ):
+            continue
+        try:
+            summary = json.loads(artifact.content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(summary, dict) and type(summary.get("event_count")) is int:
+            return summary["event_count"] == 0
+    return False
 
 
 def _analysis_message_key(request: Request) -> tuple[str, str, str] | None:
@@ -722,6 +1181,14 @@ def _catalog(application: FastAPI) -> BadmintonCatalogService:
 
 
 def _map_domain_error(exc: DataError) -> tuple[int, str, str]:
+    if isinstance(exc, AnalysisResultExpired):
+        return 410, "analysis_result_expired", "保存分析結果已逾期，請重新執行分析"
+    if isinstance(exc, AnalysisResultNotFound):
+        return 404, "analysis_result_not_found", "找不到此聊天室可使用的分析結果"
+    if isinstance(exc, AnalysisResultOutputError):
+        return 422, "analysis_result_output_error", str(exc)
+    if isinstance(exc, AnalysisResultStoreUnavailable):
+        return 503, "analysis_result_store_unavailable", "分析結果暫存目前無法使用"
     if isinstance(exc, (QueryValidationError, UnknownPlayerAliasError)):
         return 400, "invalid_input", "查詢輸入不符合工具契約"
     if isinstance(exc, AmbiguousPlayerAliasError):
@@ -731,13 +1198,13 @@ def _map_domain_error(exc: DataError) -> tuple[int, str, str]:
     if isinstance(exc, SandboxPolicyError):
         return 400, "invalid_input", "分析程式不符合 sandbox policy"
     if isinstance(exc, SandboxCodeError):
-        return 422, "analysis_code_error", str(exc)
+        return 422, "analysis_code_error", sandbox_code_error_message(exc)
     if isinstance(exc, SandboxOutputError):
         if str(exc) == "sandbox 必須產生至少一個 artifact":
             return (
                 422,
                 "analysis_output_error",
-                "分析沒有產生檔案；請在 BADMINTON_OUTPUT_DIR 寫入至少一個檔案（例如 summary.json），print 輸出不算產物",
+                "分析沒有產生可重用檔案；正式結果請在 BADMINTON_OUTPUT_DIR 保存 JSON、CSV 或 JSONL，stdout-only 探查不能供繪圖",
             )
         return (
             422,
@@ -810,123 +1277,155 @@ def _match_response(summary: Any) -> MatchSummaryResponse:
 
 def _analysis_response(
     result: SandboxResult,
+    stored: StoredAnalysisResult | None,
     *,
-    chart_bridge: OpenWebUIChartBridge | None = None,
-    chat_id: str | None = None,
-    message_id: str | None = None,
-    user_id: str | None = None,
-    plotly_asset_url: str = DEFAULT_PLOTLY_ASSET_URL,
+    analysis_runs_remaining: int | None = None,
 ) -> AnalysisResponse:
     manifest = result.manifest
-    artifact_responses: list[ArtifactResponse] = []
-    chart_spec_indices = [
-        index
-        for index, artifact in enumerate(result.artifacts)
-        if artifact.relative_path == CHART_SPEC_FILE
-    ]
-    plotly_indices = [
-        index
-        for index, artifact in enumerate(result.artifacts)
-        if artifact.relative_path == PLOTLY_CHARTS_FILE
-    ]
-    control_artifact_indices = set(chart_spec_indices) | set(plotly_indices)
-    rich_ui_status: Literal[
-        "not_requested",
-        "embedded",
-        "duplicate_suppressed",
-        "invalid_spec",
-        "bridge_not_configured",
-        "chat_context_missing",
-        "identity_mismatch",
-        "embed_failed",
-        "embed_unknown",
-    ] = "not_requested"
-    rich_ui_error: str | None = None
-
-    rich_html: str | None = None
-    if plotly_indices:
-        if _summary_has_zero_events(result.artifacts):
-            rich_ui_status = "invalid_spec"
-            rich_ui_error = (
-                "summary.json 的 event_count 為 0，不嵌入空圖；請核對球員別名與篩選條件"
-            )
-        elif len(plotly_indices) != 1:
-            rich_ui_status = "invalid_spec"
-            rich_ui_error = "分析輸出只能包含一個根目錄 plotly_charts.json"
-        else:
-            try:
-                plotly_charts = parse_plotly_charts_artifact(
-                    result.artifacts[plotly_indices[0]]
-                )
-                rich_html = render_plotly_charts_html(
-                    plotly_charts,
-                    asset_url=plotly_asset_url,
-                )
-            except PlotlySpecError as exc:
-                rich_ui_status = "invalid_spec"
-                rich_ui_error = str(exc)[:200]
-            except ValueError:
-                rich_ui_status = "invalid_spec"
-                rich_ui_error = "Plotly 本機資產 URL 設定無效"
-
-    # 舊 chart_spec 與 PNG 只供歷史對話保留檢視，不再作新圖的備援。
-    if (
-        rich_html is None
-        and rich_ui_status != "invalid_spec"
-        and (chart_spec_indices or any(_is_png_candidate(a) for a in result.artifacts))
-    ):
-        rich_ui_status = "invalid_spec"
-        rich_ui_error = (
-            "新圖表只接受 plotly_charts.json 互動圖；PNG 與 chart_spec 不會附加"
+    if stored is None:
+        preview, truncated = _bounded_stdout_preview(result)
+        return AnalysisResponse(
+            result_id=None,
+            result_fingerprint=None,
+            analysis_runs_remaining=analysis_runs_remaining,
+            job_id=result.job_id,
+            exit_code=result.exit_code,
+            snapshot_id=manifest.snapshot_id,
+            source=_safe_source_name(manifest.source),
+            row_count=manifest.row_count,
+            columns=list(manifest.columns),
+            artifacts=[],
+            stdout_preview=preview,
+            stdout_preview_truncated=truncated,
         )
-
-    if rich_html is not None:
-        rich_ui_status, rich_ui_error = _emit_rich_ui(
-            rich_html,
-            chart_bridge=chart_bridge,
-            chat_id=chat_id,
-            message_id=message_id,
-            user_id=user_id,
-        )
-
-    for index, artifact in enumerate(result.artifacts):
-        if index in control_artifact_indices or _is_png_candidate(artifact):
-            # 控制檔與 PNG 不回傳給模型，也不寫入聊天附件。
-            continue
-        artifact_responses.append(_artifact_response(artifact))
 
     return AnalysisResponse(
+        result_id=stored.result_id,
+        result_fingerprint=_saved_result_fingerprint(stored),
+        analysis_runs_remaining=analysis_runs_remaining,
         job_id=result.job_id,
         exit_code=result.exit_code,
         snapshot_id=manifest.snapshot_id,
         source=_safe_source_name(manifest.source),
         row_count=manifest.row_count,
         columns=list(manifest.columns),
-        rich_ui_status=rich_ui_status,
-        rich_ui_error=rich_ui_error,
-        artifacts=artifact_responses,
+        artifacts=_analysis_file_responses(stored.files),
+        stdout_preview=None,
+        stdout_preview_truncated=False,
     )
 
 
-def _summary_has_zero_events(artifacts: tuple[Any, ...]) -> bool:
-    """摘要明示無事件時擋下圖表，避免先嵌空圖後無法同則修正。"""
+def _analysis_file_segment(stored_file: Any, offset_bytes: int) -> AnalysisFileResponse:
+    """以 byte 游標切 UTF-8 完整字元；下一位置只前進實際回傳的 bytes。"""
 
-    for artifact in artifacts:
-        if (
-            artifact.relative_path != "summary.json"
-            or artifact.size_bytes > MAX_ARTIFACT_TEXT_PREVIEW_BYTES
-        ):
+    content = stored_file.content
+    if not 0 <= offset_bytes <= len(content):
+        raise ValueError("無效位置")
+    content.decode("utf-8", errors="strict")
+    content[:offset_bytes].decode("utf-8", errors="strict")
+    end = min(len(content), offset_bytes + MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES)
+    # 已確認全文合法，只需避開段尾被切開的多 byte 字元。
+    preview = content[offset_bytes:end].decode("utf-8", errors="ignore")
+    next_offset = offset_bytes + len(preview.encode("utf-8"))
+    return AnalysisFileResponse(
+        relative_path=stored_file.relative_path,
+        kind=stored_file.kind,
+        extension=stored_file.extension,
+        mime_type=stored_file.mime_type,
+        size_bytes=stored_file.size_bytes,
+        text_preview=preview,
+        preview_truncated=offset_bytes > 0 or next_offset < len(content),
+        preview_offset_bytes=offset_bytes,
+        next_offset_bytes=next_offset,
+        has_more=next_offset < len(content),
+    )
+
+
+def _analysis_file_responses(
+    stored_files: tuple[Any, ...],
+) -> list[AnalysisFileResponse]:
+    """依原分析契約建立實際檔名與共享 4 KiB UTF-8 預覽。"""
+
+    previewable_indexes = sorted(
+        (
+            index
+            for index, stored_file in enumerate(stored_files)
+            if stored_file.extension in {".json", ".csv", ".jsonl"}
+        ),
+        key=lambda index: (stored_files[index].size_bytes, index),
+    )
+    previews: dict[int, tuple[str | None, bool]] = {}
+    remaining_preview_bytes = MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES
+    for index in previewable_indexes:
+        stored_file = stored_files[index]
+        if remaining_preview_bytes <= 0:
+            previews[index] = (None, True)
             continue
         try:
-            raw = base64.b64decode(artifact.content_base64, validate=True)
-            if len(raw) != artifact.size_bytes:
-                continue
-            summary = json.loads(raw)
-        except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if isinstance(summary, dict) and type(summary.get("event_count")) is int:
-            return summary["event_count"] == 0
-    return False
+            content = stored_file.content
+            preview_limit = min(
+                MAX_ANALYSIS_TEXT_PREVIEW_BYTES,
+                remaining_preview_bytes,
+            )
+            truncated = len(content) > preview_limit
+            preview = content[:preview_limit].decode(
+                "utf-8",
+                errors="ignore" if truncated else "strict",
+            )
+            remaining_preview_bytes -= len(preview.encode("utf-8"))
+            previews[index] = (preview, truncated)
+        except UnicodeDecodeError:
+            previews[index] = (None, len(stored_file.content) > preview_limit)
+
+    file_responses: list[AnalysisFileResponse] = []
+    for index, stored_file in enumerate(stored_files):
+        preview, truncated = previews.get(index, (None, False))
+        file_responses.append(
+            AnalysisFileResponse(
+                relative_path=stored_file.relative_path,
+                kind=stored_file.kind,
+                extension=stored_file.extension,
+                mime_type=stored_file.mime_type,
+                size_bytes=stored_file.size_bytes,
+                text_preview=preview,
+                preview_truncated=truncated,
+            )
+        )
+    return file_responses
+
+
+def _saved_result_fingerprint(stored: StoredAnalysisResult) -> str | None:
+    """依保存檔案的精確內容建 fingerprint，不納入檔名或回應包裝。"""
+
+    file_digests = sorted(
+        (len(item.content), hashlib.sha256(item.content).digest())
+        for item in stored.files
+        if item.extension in {".json", ".csv", ".jsonl"}
+    )
+    if not file_digests:
+        return None
+    digest = hashlib.sha256(b"badmintonai-saved-result-v1\0")
+    for size_bytes, file_digest in file_digests:
+        digest.update(size_bytes.to_bytes(8, "big"))
+        digest.update(file_digest)
+    return digest.hexdigest()
+
+
+def _bounded_stdout_preview(result: SandboxResult) -> tuple[str | None, bool]:
+    """以 UTF-8 位元組再次限制 stdout-only 探查回應。"""
+
+    value = result.stdout_preview
+    if not isinstance(value, str):
+        return None, False
+    content = value.encode("utf-8", errors="replace")
+    truncated = bool(result.stdout_preview_truncated)
+    if len(content) > MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES:
+        content = content[:MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES]
+        truncated = True
+    preview = content.decode("utf-8", errors="ignore")
+    if not preview.strip():
+        return None, truncated
+    return preview, truncated
 
 
 def _emit_rich_ui(
@@ -974,68 +1473,6 @@ def _emit_rich_ui(
     )
 
 
-def _is_png_candidate(artifact: Any) -> bool:
-    return (
-        artifact.extension.casefold() == ".png"
-        or artifact.mime_type == "image/png"
-        or artifact.kind == "chart"
-    )
-
-
-def _artifact_response(
-    artifact: Any,
-    *,
-    content_base64: str | None = None,
-    chart_display_status: Literal[
-        "not_applicable",
-        "attached",
-        "rendered_as_rich_ui",
-        "invalid_png",
-        "bridge_not_configured",
-        "chat_context_missing",
-        "identity_mismatch",
-        "attachment_failed",
-        "attachment_unknown",
-    ] = "not_applicable",
-) -> ArtifactResponse:
-    """保留原始 artifact，並為支援的 UTF-8 文字格式附上 bounded preview。"""
-
-    preview: str | None = None
-    truncated = False
-    if artifact.extension.lower() in TEXT_ARTIFACT_EXTENSIONS:
-        try:
-            content = base64.b64decode(artifact.content_base64, validate=True)
-            if len(content) == artifact.size_bytes:
-                decoded = content.decode("utf-8")
-                truncated = len(content) > MAX_ARTIFACT_TEXT_PREVIEW_BYTES
-                preview = (
-                    content[:MAX_ARTIFACT_TEXT_PREVIEW_BYTES].decode(
-                        "utf-8",
-                        errors="ignore",
-                    )
-                    if truncated
-                    else decoded
-                )
-        except (binascii.Error, UnicodeDecodeError):
-            pass
-
-    return ArtifactResponse(
-        relative_path=artifact.relative_path,
-        kind=artifact.kind,
-        extension=artifact.extension,
-        mime_type=artifact.mime_type,
-        size_bytes=artifact.size_bytes,
-        content_base64=(
-            artifact.content_base64
-            if content_base64 is None and not _is_png_candidate(artifact)
-            else content_base64
-        ),
-        chart_display_status=chart_display_status,
-        text_preview=preview,
-        preview_truncated=truncated,
-    )
-
-
 def _safe_source_name(value: str) -> str:
     name = Path(value).name
     return name if name not in {"", ".", ".."} else "dataset"
@@ -1060,7 +1497,10 @@ app = create_app()
 __all__ = [
     "AnalysisRequest",
     "AnalysisResponse",
-    "ArtifactResponse",
+    "AnalysisFileResponse",
+    "ReadAnalysisResultResponse",
+    "RenderAnalysisRequest",
+    "RenderAnalysisResponse",
     "ColumnCatalogResponse",
     "ColumnSummaryResponse",
     "DatasetSummaryResponse",

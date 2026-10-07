@@ -53,6 +53,8 @@ button {
 }
 button:hover:not(:disabled) { background: var(--accent-strong); }
 button:disabled { opacity: 0.55; cursor: not-allowed; }
+.question-retry { padding: 0.35rem 0.45rem; font-size: 0.75rem; }
+.question-matrix .question-retry { width: 100%; margin-top: 0.25rem; }
 button.secondary { background: var(--surface); color: var(--text); border-color: var(--border); }
 button.secondary:hover:not(:disabled) { background: var(--surface-soft); }
 button.danger { background: var(--danger); border-color: var(--danger); color: var(--danger-button-text); }
@@ -154,7 +156,7 @@ textarea { width: 100%; min-height: 5.5rem; resize: vertical; padding: 0.6rem; b
 .question-tile:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; z-index: 1; }
 .tile-number { font-size: 0.85rem; font-weight: 850; font-variant-numeric: tabular-nums; }
 .tile-status { max-width: 100%; overflow: hidden; color: var(--muted); font-size: 0.54rem; text-overflow: ellipsis; white-space: nowrap; }
-.status-pending, .state-swatch.state-pending { --state-ink: #62747d; --state-surface: #edf1f2; }
+.status-queued, .state-swatch.state-queued { --state-ink: #62747d; --state-surface: #edf1f2; }
 .status-running, .state-swatch.state-running { --state-ink: #087884; --state-surface: #e0f2f3; }
 .status-awaiting_clarification, .state-swatch.state-awaiting_clarification { --state-ink: #8b6400; --state-surface: #fff4d1; }
 .status-needs_review, .state-swatch.state-needs_review { --state-ink: #9a4d00; --state-surface: #fff0df; }
@@ -176,16 +178,19 @@ textarea { width: 100%; min-height: 5.5rem; resize: vertical; padding: 0.6rem; b
 .detail-metrics dd { margin: 0.05rem 0 0; font-weight: 700; overflow-wrap: anywhere; }
 .conversation-link:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 .conversation-frame { display: block; width: 100%; min-width: 0; height: min(65vh, 48rem); min-height: 22rem; border: 0; border-top: 1px solid var(--border); border-radius: 0 0 0.5rem 0.5rem; background: var(--surface); color-scheme: light dark; }
+.conversation-frame[hidden] { display: none; }
 .conversation-link { width: fit-content; font-weight: 750; }
 .chart-summary { padding: 0.6rem 0.7rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--surface-soft); }
 .clarification-queue-item { display: grid; gap: 0.3rem; padding: 0.6rem; border: 1px solid var(--border); border-radius: 0.5rem; background: var(--surface-soft); }
 .clarification-queue-item > p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .clarification-detail { margin-top: 0.2rem; }
 .clarification-detail h4 { margin: 0; }
+.queued-answer { padding: 0.55rem 0.65rem; border-inline-start: 3px solid var(--state-ink, var(--border)); border-radius: 0.2rem; background: var(--state-surface, var(--surface-soft)); }
+.queued-clarification-actions { display: flex; flex-wrap: wrap; gap: 0.45rem; }
 .question-detail-dialog button:focus-visible, .question-detail-dialog textarea:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 
 @media (prefers-color-scheme: dark) {
-  .status-pending, .state-swatch.state-pending { --state-ink: #a7b6bd; --state-surface: #29383d; }
+  .status-queued, .state-swatch.state-queued { --state-ink: #a7b6bd; --state-surface: #29383d; }
   .status-running, .state-swatch.state-running { --state-ink: #71d6de; --state-surface: #18383d; }
   .status-awaiting_clarification, .state-swatch.state-awaiting_clarification { --state-ink: #f0ca69; --state-surface: #3d351f; }
   .status-needs_review, .state-swatch.state-needs_review { --state-ink: #ffbb78; --state-surface: #422c1d; }

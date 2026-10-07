@@ -377,6 +377,7 @@ def build_chat_export_html(
 (function () {
   "use strict";
   const charts = JSON.parse(document.getElementById("chat-chart-data").textContent);
+  const pdfState = window.__BADMINTON_PDF_RENDER__;
   const colorScheme = window.matchMedia("(prefers-color-scheme: light)");
   const themeMode = document.documentElement.dataset.theme;
   const rendered = [];
@@ -417,24 +418,38 @@ def build_chat_export_html(
     }
     return update;
   };
-  for (const [index, chart] of charts.entries()) {
-    const target = document.getElementById("chart-" + index);
-    const layout = JSON.parse(JSON.stringify(chart.figure.layout || {}));
-    delete layout.title;
-    layout.autosize = true;
-    const axes = applyPalette(layout, chart.figure.data, palette());
-    const options = {responsive: true, displaylogo: false, scrollZoom: false};
-    window.Plotly.newPlot(target, chart.figure.data, layout, options)
-      .then(function () {
-        rendered.push({target, axes});
-        if (Array.isArray(chart.figure.frames) && chart.figure.frames.length) {
-          return window.Plotly.addFrames(target, chart.figure.frames);
-        }
-        return null;
-      })
-      .catch(function () {
-        target.textContent = "此圖表無法呈現。";
-      });
+  try {
+    const jobs = [];
+    for (const [index, chart] of charts.entries()) {
+      const target = document.getElementById("chart-" + index);
+      const layout = JSON.parse(JSON.stringify(chart.figure.layout || {}));
+      delete layout.title;
+      layout.autosize = true;
+      const axes = applyPalette(layout, chart.figure.data, palette());
+      const options = {responsive: true, displaylogo: false, scrollZoom: false};
+      const job = window.Plotly.newPlot(target, chart.figure.data, layout, options)
+        .then(function () {
+          rendered.push({target, axes});
+          if (Array.isArray(chart.figure.frames) && chart.figure.frames.length) {
+            return window.Plotly.addFrames(target, chart.figure.frames);
+          }
+          return null;
+        })
+        .catch(function () {
+          target.textContent = "此圖表無法呈現。";
+          throw new Error("chart-render-failed");
+        });
+      jobs.push(job);
+    }
+    Promise.all(jobs).then(function () {
+      pdfState.status = "ready";
+    }).catch(function () {
+      pdfState.status = "error";
+      pdfState.error = "chart-render-failed";
+    });
+  } catch {
+    pdfState.status = "error";
+    pdfState.error = "chart-render-failed";
   }
   if (themeMode === "auto") {
     colorScheme.addEventListener("change", () => {
@@ -449,6 +464,7 @@ def build_chat_export_html(
         if chart_payload
         else ""
     )
+    pdf_render_status = "pending" if chart_payload else "ready"
     document = f"""<!doctype html>
 <html lang="zh-Hant" data-theme="{theme}">
 <head>
@@ -457,9 +473,11 @@ def build_chat_export_html(
 <meta http-equiv="Content-Security-Policy" content="{csp}">
 <title>Open WebUI 對話匯出</title>
 <style>
-:root {{ color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #fff; color: #262626; }}
+:root {{ color-scheme: light; font-family: "Noto Sans CJK TC", "Noto Sans TC", system-ui, -apple-system, "Segoe UI", sans-serif; background: #fff; color: #262626; }}
 :root[data-theme="dark"] {{ color-scheme: dark; background: #171717; color: #e5e5e5; }}
 @media (prefers-color-scheme: dark) {{ :root[data-theme="auto"] {{ color-scheme: dark; background: #171717; color: #e5e5e5; }} }}
+/* 只隱藏瀏覽器插入 html 根層的空白 iframe，不影響正文或圖表。 */
+html > iframe:empty:not([src]):not([srcdoc]) {{ display: none !important; }}
 body {{ max-width: 960px; margin: 0 auto; padding: 24px 16px; line-height: 1.55; }}
 .message {{ margin: 0 0 20px; padding: 16px; border: 1px solid #8885; border-radius: 10px; }}
 .message[data-role="user"] {{ background: #8881; }}
@@ -490,12 +508,26 @@ body {{ max-width: 960px; margin: 0 auto; padding: 24px 16px; line-height: 1.55;
 .embed-warning {{ margin-top: 12px; padding: 10px 12px; color: #7f1d1d; background: #fee2e2; border-radius: 6px; overflow-wrap: anywhere; }}
 :root[data-theme="dark"] .embed-warning {{ color: #fecaca; background: #450a0a; }}
 @media (prefers-color-scheme: dark) {{ :root[data-theme="auto"] .embed-warning {{ color: #fecaca; background: #450a0a; }} }}
+@media print {{
+  @page {{ size: A4; margin: 14mm; }}
+  :root,:root[data-theme="dark"] {{ color-scheme: light !important; background: #fff !important; color: #171717 !important; print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
+  body {{ max-width: none; margin: 0; padding: 0; background: #fff !important; color: #171717 !important; font-size: 10pt; }}
+  .message {{ background: #fff !important; color: #171717 !important; border-color: #aaa; break-inside: auto; }}
+  .message header {{ break-after: avoid-page; page-break-after: avoid; }}
+  .message-content table {{ display: table; width: 100%; max-width: 100%; overflow: visible; }}
+  .message-content thead {{ display: table-header-group; }}
+  .message-content tr {{ break-inside: avoid; page-break-inside: avoid; }}
+  .message-content pre {{ white-space: pre-wrap; overflow-wrap: anywhere; }}
+  .chart-card {{ break-inside: avoid; page-break-inside: avoid; }}
+  .chart {{ min-height: 320px; }}
+}}
 </style>
 </head>
 <body>
 <main aria-label="對話紀錄">
 {"".join(message_markup)}
 </main>
+<script>window.__BADMINTON_PDF_RENDER__ = {{status: "{pdf_render_status}", error: null}};</script>
 {library_block}
 {chart_block}
 {renderer_block}

@@ -12,10 +12,8 @@
   const rangeInput = document.querySelector("#range-input");
   const applyRangeButton = document.querySelector("#apply-range-button");
   const questionMatrix = document.querySelector("#question-matrix");
-  const historicalQuestionMatrix = document.querySelector("#historical-question-matrix");
   const clarificationBox = document.querySelector("#clarification-list");
-  const historicalRunDetail = document.querySelector("#historical-run-detail");
-  const historicalRunTitle = document.querySelector("#historical-run-title");
+  const selectedRunNotice = document.querySelector("#selected-run-notice");
   const runSummary = document.querySelector("#run-summary");
   const statusText = document.querySelector("#run-status");
   const notice = document.querySelector("#notice");
@@ -35,10 +33,17 @@
   const pageLede = document.querySelector("#page-lede");
   let preview = null;
   let refreshInProgress = false;
+  const retryRequests = new Set();
   let canStart = false;
+  let startInProgress = false;
   let detailReturnFocus = null;
   let activeDetail = null;
   let detailConversationFrame = null;
+  let renderedRunId = null;
+  const requestedRunId = /(?:^|[?&])run_id=([a-f0-9]{32})(?:&|$)/.exec(
+    window.location.search || "",
+  )?.[1];
+  const selectedRunId = requestedRunId || null;
 
   const activePage = window.location.pathname === "/badmintonai/evaluation/new"
     ? "new"
@@ -70,25 +75,27 @@
     stopping: "停止中",
     stopped: "已停止，可續跑",
     paused: "待續跑",
-    awaiting_clarification: "等待人工補答",
-    needs_review: "需要人工複核",
-    completed: "全部完成",
-    finished_with_errors: "已結束，含失敗題",
-    pending: "待執行",
+    queued: "排隊中",
+    awaiting_clarification: "待補答",
+    needs_review: "需複核",
+    completed: "已完成",
     failed: "失敗",
+    // 下列狀態描述 run，不納入題目六分類。
+    pending: "待執行",
+    finished_with_errors: "已結束，含失敗題",
   };
   const questionStatuses = [
-    "pending",
+    "queued",
     "running",
     "awaiting_clarification",
-    "needs_review",
     "completed",
     "failed",
+    "needs_review",
   ];
   const shortStatusNames = {
-    pending: "待執行",
+    queued: "排隊中",
     running: "執行中",
-    awaiting_clarification: "補答",
+    awaiting_clarification: "待補答",
     needs_review: "複核",
     completed: "完成",
     failed: "失敗",
@@ -151,6 +158,7 @@
     );
     startButton.disabled = !(
       hasPreview && selectedIds.length > 0 && confirmRun.checked && canStart
+        && !startInProgress
     );
   }
 
@@ -217,6 +225,26 @@
   }
 
   function usageText(usage) {
+    if (usage && typeof usage === "object" && usage.fields) {
+      if (!Number.isInteger(usage.attempt_count) || usage.attempt_count <= 0) {
+        return "尚未取得模型實際用量（尚無已送出的模型請求）";
+      }
+      if (usage.has_usage !== true) {
+        return `尚未取得模型實際用量（${usage.attempt_count} 次請求用量缺失）`;
+      }
+      return ["input_tokens", "output_tokens", "total_tokens"]
+        .map((key) => {
+          const field = usage.fields[key] || {};
+          if (field.complete === true && Number.isInteger(field.known_total)) {
+            return `${key}: ${field.known_total}`;
+          }
+          if (Number.isInteger(field.known_total)) {
+            return `${key}: 已取得 ${field.known_total}（缺少 ${field.missing_attempt_count} 次用量；實際可能更高）`;
+          }
+          return `${key}: 未取得（缺少 ${field.missing_attempt_count} 次用量；實際可能更高）`;
+        })
+        .join(" · ");
+    }
     const keys = ["input_tokens", "output_tokens", "total_tokens"];
     if (!usage || typeof usage !== "object") return "未取得模型實際用量";
     if (!keys.some((key) => Number.isInteger(usage[key]) && usage[key] >= 0)) {
@@ -232,7 +260,33 @@
     detailConversationFrame = null;
   }
 
-  async function loadConversationPreview(frame, path, source, help, conversation, prompt, answer) {
+  function showConversationFallback(frame, help, conversation, answer) {
+    if (detailConversationFrame !== frame) return;
+    frame.removeAttribute("src");
+    frame.remove();
+    detailConversationFrame = null;
+    help.textContent = answer
+      ? "原對話目前無法讀取；原題保留於上方，以下提供安全回答備援。"
+      : "原對話目前無法讀取；題目與補答資訊仍保留於上方。";
+    if (answer) conversation.append(answer);
+  }
+
+  function statusPath(useSelectedRun = true) {
+    return useSelectedRun && selectedRunId
+      ? `/status?run_id=${encodeURIComponent(selectedRunId)}`
+      : "/status";
+  }
+
+  async function loadConversationPreview(frame, path, source, help, conversation, answer) {
+    let navigationRequested = false;
+    frame.addEventListener("load", () => {
+      if (!navigationRequested || detailConversationFrame !== frame) return;
+      frame.hidden = false;
+      help.textContent = "原對話已載入；完整 Markdown 與互動圖表顯示於下方。";
+    });
+    frame.addEventListener("error", () => {
+      showConversationFallback(frame, help, conversation, answer);
+    }, { once: true });
     try {
       const response = await fetch(path, {
         credentials: "same-origin",
@@ -250,14 +304,10 @@
         throw new Error("原對話預覽無法讀取");
       }
       if (detailConversationFrame !== frame) return;
+      navigationRequested = true;
       frame.src = source;
     } catch {
-      if (detailConversationFrame !== frame) return;
-      frame.removeAttribute("src");
-      frame.remove();
-      detailConversationFrame = null;
-      help.textContent = "原對話目前無法讀取；以下提供安全的題目與回答備援。";
-      conversation.append(prompt, answer);
+      showConversationFallback(frame, help, conversation, answer);
     }
   }
 
@@ -296,6 +346,7 @@
   }
 
   function questionStateName(question) {
+    if (question.manual_retry_succeeded === true) return "重試後成功";
     const state = questionState(question);
     return statusNames[state] || "狀態未知";
   }
@@ -310,33 +361,79 @@
     list.append(term, description);
   }
 
+  function createRetryButton(question, runId) {
+    if (question.status !== "failed" || !safeRunId(runId)) return null;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "question-retry secondary";
+    retry.textContent = "retry";
+    retry.setAttribute("aria-label", `重試 Q${question.id} 最後失敗回合`);
+    const key = `${runId}:${question.id}`;
+    retry.disabled = retryRequests.has(key) || question.can_retry !== true;
+    retry.title = retry.disabled ? "此題已有工作排隊或舊回合尚待復原" : "保留上下文並排入最後失敗回合的人工重試";
+    retry.addEventListener("click", async () => {
+      if (retryRequests.has(key)) return;
+      retryRequests.add(key);
+      retry.disabled = true;
+      try {
+        const result = await api(`/runs/${encodeURIComponent(runId)}/questions/${encodeURIComponent(String(question.id))}/retry`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({expected_retry_count: question.manual_retry_count || 0}),
+        });
+        setNotice(result?.already_queued
+          ? `Q${question.id} 的人工 retry 已在佇列中。`
+          : `Q${question.id} 的人工 retry 已排入佇列。`);
+      } catch (error) { setNotice(error.message, true); }
+      finally { retryRequests.delete(key); await refresh(); }
+    });
+    return retry;
+  }
+
   function renderQuestion(question, runId, showAnnotationTools = false) {
     const item = document.createElement("article");
     item.className = "question-detail";
     const head = document.createElement("div");
     head.className = "question-head";
-    head.append(
-      createText("h3", `Q${question.id}`),
-      createText("span", questionStateName(question), `status-pill status-${questionState(question)}`),
-    );
+    head.append(createText("h3", `Q${question.id}`));
     const prompt = document.createElement("section");
     prompt.className = "detail-block";
     prompt.append(createText("h4", "原始題目"), createText("p", question.prompt || "未提供"));
 
-    const answer = document.createElement("section");
-    answer.className = "detail-block";
-    answer.append(createText("h4", "回答"));
-    answer.append(createText(
-      "p",
-      question.assistant_text || "沒有安全可顯示的回答文字；請檢視原對話或安全失敗提示。",
-      "answer",
-    ));
+    const statePill = createText(
+      "span",
+      questionStateName(question),
+      `status-pill status-${questionState(question)}`,
+    );
+    head.append(statePill);
+    const hasClarification = Boolean(question.queued_clarification)
+      || question.status === "awaiting_clarification";
+    const answer = hasClarification ? null : document.createElement("section");
+    if (answer) {
+      answer.className = "detail-block";
+      answer.append(createText("h4", "回答"));
+      answer.append(createText(
+        "p",
+        question.assistant_text || "沒有安全可顯示的回答文字；請檢視原對話或安全失敗提示。",
+        "answer",
+      ));
+    }
 
     const metrics = document.createElement("dl");
     metrics.className = "detail-metrics";
     appendDetailValue(metrics, "處理耗時（不含人工等待）", formatMs(processingElapsedMs(question)));
-    appendDetailValue(metrics, "Token", usageText(question.usage));
+    appendDetailValue(metrics, "Token", usageText(question.usage_summary));
+    appendDetailValue(
+      metrics,
+      "工作類型",
+      Array.isArray(question.work_types) && question.work_types.length
+        ? question.work_types.join("、")
+        : question.resume_required === true
+          ? "原題（明確續跑後才排入）"
+          : "尚無已執行工作",
+    );
     appendDetailValue(metrics, "重試", Number.isInteger(question.retry_count) ? String(question.retry_count) : "未提供");
+    appendDetailValue(metrics, "人工 Retry", String(question.manual_retry_count || 0));
     appendDetailValue(metrics, "工具呼叫", Number.isInteger(question.tool_call_count) ? String(question.tool_call_count) : "未提供");
     appendDetailValue(metrics, "錯誤紀錄", Number.isInteger(question.error_count) ? String(question.error_count) : "未提供");
 
@@ -356,6 +453,7 @@
       frame.className = "conversation-frame";
       frame.title = `Q${question.id} 原始 Open WebUI 對話（唯讀）`;
       frame.loading = "eager";
+      frame.hidden = true;
       frame.setAttribute("title", frame.title);
       frame.setAttribute("loading", "eager");
       frame.setAttribute("sandbox", "allow-scripts");
@@ -379,17 +477,23 @@
         conversationSource,
         help,
         conversation,
-        prompt,
         answer,
       );
     } else {
       conversation.append(createText("p", "此題沒有可供檢視的原始對話。", "help"));
     }
-    if (hasConversation) {
-      item.append(head, conversation, metrics);
-    } else {
-      item.append(head, prompt, answer, metrics, conversation);
+    item.append(head, prompt);
+    if (typeof question.clarification_projection_note === "string") {
+      item.append(createText("p", question.clarification_projection_note, "help"));
     }
+    if (question.queued_clarification) {
+      item.append(renderQueuedClarification(question, runId));
+    } else if (question.status === "awaiting_clarification") {
+      item.append(renderClarificationForm(question, runId));
+    } else if (!hasConversation && answer) {
+      item.append(answer);
+    }
+    item.append(metrics);
     if (typeof question.failure_message === "string" && question.failure_message) {
       item.append(createText("p", question.failure_message, "notice error"));
     } else if (Number.isInteger(question.error_count) && question.error_count > 0) {
@@ -400,10 +504,7 @@
       ));
     }
 
-    if (question.status === "awaiting_clarification") {
-      item.append(renderClarificationForm(question));
-    }
-
+    item.append(conversation);
     const hasReviewCandidate = question.clarification_review_candidate === true;
     const annotation = question.classification_annotation;
     if (hasReviewCandidate || annotation || showAnnotationTools) {
@@ -474,7 +575,6 @@
               });
               setNotice(`Q${question.id} 人工分類註記已另存；原始 checkpoint 未改寫。`);
               if (saved && saved.run) {
-                renderHistoricalRun(saved);
                 const updated = saved.run.questions.find(
                   (item) => String(item.id) === String(question.id),
                 );
@@ -535,7 +635,7 @@
       );
       button.append(
         createText("span", `Q${question.id}`, "tile-number"),
-        createText("span", shortStatusNames[state] || "未知", "tile-status"),
+        createText("span", question.manual_retry_succeeded === true ? "重試後成功" : shortStatusNames[state] || "未知", "tile-status"),
       );
       button.addEventListener("click", () => {
         const canAnnotate = showAnnotationTools
@@ -560,6 +660,8 @@
         }
       });
       cell.append(button);
+      const retry = createRetryButton(question, runId);
+      if (retry) cell.append(retry);
       container.append(cell);
     });
     if (focusedQuestionId) {
@@ -569,15 +671,7 @@
     }
   }
 
-  function renderHistoricalRun(payload) {
-    if (!payload || !payload.run || !Array.isArray(payload.run.questions)) return;
-    const runStatus = displayRunStatus(payload.run_status, payload.run.questions);
-    historicalRunTitle.textContent = `歷史 run ${payload.run_id || ""} · ${statusNames[runStatus] || runStatus || ""}`;
-    renderQuestionMatrix(historicalQuestionMatrix, payload.run.questions, payload.run_id, true);
-    historicalRunDetail.hidden = false;
-  }
-
-  function renderClarificationForm(question) {
+  function renderClarificationForm(question, runId) {
     const section = document.createElement("section");
     section.className = "clarification-detail";
     section.append(createText("h4", "待補答"));
@@ -613,7 +707,7 @@
       fieldset.append(choicesBox);
       formElement.append(fieldset);
     }
-    const label = createText("label", "補答內容（必填，將送回同一對話）");
+    const label = createText("label", "補答內容（必填，保存後送回同一對話）");
     label.htmlFor = `answer-${question.id}`;
     const textarea = document.createElement("textarea");
     textarea.id = `answer-${question.id}`;
@@ -638,12 +732,18 @@
       textarea.setCustomValidity("");
       submit.disabled = true;
       try {
-        await api("/clarify", {
+        const result = await api("/clarify", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ question_id: String(question.id), answer }),
+          body: JSON.stringify({
+            run_id: safeRunId(runId) ? runId : undefined,
+            question_id: String(question.id),
+            answer,
+          }),
         });
-        setNotice(`Q${question.id} 補答已排入同一對話。`);
+        setNotice(result?.already_queued
+          ? `Q${question.id} 補答已在佇列中。`
+          : `Q${question.id} 補答已保存並排入佇列。`);
         detailDialog.close();
         await refresh();
       } catch (error) {
@@ -655,12 +755,97 @@
     return section;
   }
 
+  function renderQueuedClarification(question, runId) {
+    const queued = question.queued_clarification;
+    const isExecuting = queued.status === "executing";
+    const section = document.createElement("section");
+    section.className = "clarification-detail";
+    section.setAttribute("aria-live", "polite");
+    section.append(createText("h4", isExecuting ? "補答執行中" : "補答已排隊"));
+    section.append(createText(
+      "p",
+      question.assistant_text || "模型未提供文字內容。",
+      "clarification-text",
+    ));
+    section.append(createText("p", "已保存補答", "help"));
+    section.append(createText(
+      "p",
+      queued.answer || "沒有可顯示的已保存補答。",
+      "clarification-text queued-answer",
+    ));
+    if (isExecuting) {
+      section.append(createText("p", "此補答已開始送回原對話，目前無法修改或取消。", "help"));
+      return section;
+    }
+
+    const formElement = document.createElement("form");
+    formElement.className = "clarification queued-clarification-edit";
+    formElement.setAttribute("aria-label", `修改第 ${question.id} 題已排隊補答`);
+    const label = createText("label", "修改已保存補答");
+    const textarea = document.createElement("textarea");
+    textarea.name = "answer";
+    textarea.required = true;
+    textarea.maxLength = 8000;
+    textarea.value = queued.answer || "";
+    label.htmlFor = `queued-answer-${question.id}`;
+    textarea.id = label.htmlFor;
+    const actions = document.createElement("div");
+    actions.className = "queued-clarification-actions";
+    const save = createText("button", "更新補答");
+    save.type = "submit";
+    const cancel = createText("button", "取消排隊", "secondary");
+    cancel.type = "button";
+    cancel.addEventListener("click", async () => {
+      cancel.disabled = true;
+      try {
+        await api(`/clarification-queue/${encodeURIComponent(runId)}/${encodeURIComponent(String(question.id))}`, {
+          method: "DELETE",
+        });
+        setNotice(`Q${question.id} 已取消排隊補答。`);
+        detailDialog.close();
+        await refresh();
+      } catch (error) {
+        setNotice(error.message, true);
+        cancel.disabled = false;
+      }
+    });
+    actions.append(save, cancel);
+    formElement.append(label, textarea, actions);
+    formElement.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!textarea.value.trim()) {
+        textarea.setCustomValidity("請輸入補答內容。");
+        textarea.reportValidity();
+        return;
+      }
+      textarea.setCustomValidity("");
+      save.disabled = true;
+      cancel.disabled = true;
+      try {
+        await api(`/clarification-queue/${encodeURIComponent(runId)}/${encodeURIComponent(String(question.id))}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answer: textarea.value.trim() }),
+        });
+        setNotice(`Q${question.id} 已更新排隊補答。`);
+        detailDialog.close();
+        await refresh();
+      } catch (error) {
+        setNotice(error.message, true);
+        save.disabled = false;
+        cancel.disabled = false;
+      }
+    });
+    section.append(formElement);
+    return section;
+  }
+
   function renderClarifications(questions, runId) {
     const focusedQuestionId = clarificationBox.contains(document.activeElement)
       ? document.activeElement.dataset.questionId
       : null;
-    const waiting = questions.filter(
-      (question) => question.status === "awaiting_clarification",
+    const waiting = questions.filter((question) =>
+      question.status === "awaiting_clarification" || question.queued_clarification,
     );
     clarificationBox.replaceChildren();
     if (!waiting.length) {
@@ -670,13 +855,19 @@
     for (const question of waiting) {
       const item = document.createElement("li");
       item.className = "clarification-queue-item";
-      const button = createText("button", `Q${question.id} · 開啟補答`, "secondary");
+      const queueStatus = question.queued_clarification?.status;
+      const label = queueStatus === "executing"
+        ? "補答執行中"
+        : queueStatus === "queued"
+          ? "補答已排隊"
+          : "待補答";
+      const button = createText("button", `Q${question.id} · ${label}`, "secondary");
       button.type = "button";
       button.dataset.questionId = String(question.id);
       button.dataset.runId = String(runId || "");
       button.setAttribute("aria-haspopup", "dialog");
       button.setAttribute("aria-controls", "question-detail-dialog");
-      button.setAttribute("aria-label", `Q${question.id} 等待補答；開啟題目詳情與補答表單`);
+      button.setAttribute("aria-label", `Q${question.id} ${label}；開啟題目詳情`);
       button.addEventListener("click", () => openQuestionDetails(question, runId, true, button));
       item.append(button);
       if (question.assistant_text) item.append(createText("p", question.assistant_text, "muted"));
@@ -689,6 +880,15 @@
     }
   }
 
+  detailDialog.addEventListener("click", (event) => {
+    if (event.target !== detailDialog) return;
+    const bounds = detailDialog.getBoundingClientRect();
+    const outside = event.clientX < bounds.left
+      || event.clientX > bounds.right
+      || event.clientY < bounds.top
+      || event.clientY > bounds.bottom;
+    if (outside) detailDialog.close();
+  });
   closeDetailButton.addEventListener("click", () => detailDialog.close());
   detailDialog.addEventListener("close", () => {
     clearConversationPreview();
@@ -711,24 +911,35 @@
     const runStatus = displayRunStatus(state.run_status, run?.questions);
     statusText.textContent = statusNames[runStatus] || runStatus;
     canStart = state.can_start === true;
-    stopButton.disabled = !state.worker_running;
+    stopButton.disabled = state.can_stop !== true;
     resumeButton.disabled = !state.can_resume;
     updateSelectionState();
     downloadBox.replaceChildren();
     runSummary.replaceChildren();
     if (!run) {
+      renderedRunId = null;
+      selectedRunNotice.hidden = true;
       downloadBox.hidden = true;
       renderClarifications([], "");
       renderQuestionMatrix(questionMatrix, [], "", false);
       return;
     }
     const runId = safeRunId(state.run_id) ? state.run_id : (safeRunId(run.run_id) ? run.run_id : "");
+    renderedRunId = safeRunId(runId) ? runId : null;
+    const activeRunId = safeRunId(state.active_run_id) ? state.active_run_id : runId;
+    selectedRunNotice.hidden = !runId || activeRunId === runId;
+    if (!selectedRunNotice.hidden) {
+      selectedRunNotice.textContent = activeRunId
+        ? `目前檢視 run ${runId.slice(0, 8)}…；目前輪次 ${activeRunId.slice(0, 8)}… 保持獨立。`
+        : `目前檢視歷史 run ${runId.slice(0, 8)}…。`;
+    }
     if (runId) {
       downloadBox.hidden = false;
       for (const [label, suffix, openInTab] of [
         ["下載完整 JSON", "json", false],
         ["下載易讀摘要", "summary.txt", false],
         ["下載離線 HTML 報告", "report.html", false],
+        ["下載 PDF 報告", "report.pdf", false],
         ["列印／另存 PDF", "report/print", true],
       ]) {
         const link = document.createElement("a");
@@ -743,7 +954,7 @@
         downloadBox.append(link);
       }
       const printNote = document.createElement("p");
-      printNote.textContent = "PDF 由瀏覽器列印／另存；工作台不提供直接 PDF API。";
+      printNote.textContent = "可直接下載 PDF；列印頁仍可在瀏覽器手動調整列印設定。";
       downloadBox.append(printNote);
     }
     const questions = Array.isArray(run.questions) ? run.questions : [];
@@ -756,10 +967,17 @@
     const stats = document.createElement("dl");
     stats.className = "summary-grid";
     for (const [label, value] of [
-      ["總題數", String(questions.length)],
+        ["總題數", String(questions.length)],
+      ["重試後成功", `${questions.filter((question) => question.manual_retry_succeeded === true).length} 題`],
+      ["已排隊補答", `${Number.isInteger(run.queued_clarification_count) ? run.queued_clarification_count : 0} 題`],
+      ["已排隊 retry", `${Number.isInteger(run.queued_retry_count) ? run.queued_retry_count : 0} 題`],
       ["整體狀態", statusNames[runStatus] || runStatus],
       ["總處理耗時（不含等待補答）", elapsedSummary],
-      ["Token 總計", usageText(run.token_totals)],
+      ["Token 總計", usageText({
+        attempt_count: run.usage_attempt_count,
+        has_usage: Object.values(run.token_coverage || {}).some((field) => field.known_attempt_count > 0),
+        fields: run.token_coverage,
+      })],
     ]) {
       const stat = document.createElement("div");
       stat.className = "stat";
@@ -818,7 +1036,7 @@
     if (refreshInProgress) return;
     refreshInProgress = true;
     try {
-      const state = await api("/status");
+      const state = await api(statusPath());
       renderRun(state);
       if (state.last_error) setNotice("最近一次執行已中斷；請檢查狀態並續跑。", true);
       await renderRecentRuns();
@@ -828,6 +1046,16 @@
     } finally {
       refreshInProgress = false;
     }
+  }
+
+  async function waitForWorkerIdle(timeoutMs = 180000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const state = await api("/status");
+      if (!state.worker_running) return;
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+    throw new Error("目前回合仍在安全收尾；紀錄已保留，稍後可重新開始新輪。");
   }
 
   async function renderRecentRuns() {
@@ -855,20 +1083,10 @@
       printLink.rel = "noopener noreferrer";
       const info = createText("span", `${run.question_count} 題 · ${run.created_at || "時間未提供"}`);
       const annotationInfo = createText("span", `人工註記 ${run.classification_annotation_count || 0} 筆`);
-      const inspect = createText("button", "複核題目", "secondary");
-      inspect.type = "button";
-      inspect.addEventListener("click", async () => {
-        inspect.disabled = true;
-        try {
-          const payload = await api(`/runs/${encodeURIComponent(run.run_id)}`);
-          renderHistoricalRun(payload);
-        } catch (error) {
-          setNotice(error.message, true);
-        } finally {
-          inspect.disabled = false;
-        }
-      });
-      item.append(link, htmlLink, printLink, info, annotationInfo, inspect);
+      const reviewLink = document.createElement("a");
+      reviewLink.href = `/badmintonai/evaluation?run_id=${encodeURIComponent(run.run_id)}`;
+      reviewLink.textContent = "複核題目";
+      item.append(link, htmlLink, printLink, info, annotationInfo, reviewLink);
       runsList.append(item);
     }
   }
@@ -944,26 +1162,51 @@
   });
 
   startButton.addEventListener("click", async () => {
-    const questionIds = selectedQuestionIds();
-    if (!preview || !confirmRun.checked) return;
+    if (startInProgress) return;
+    const sourceSnapshot = selectedSource();
+    const previewSnapshot = preview ? { ...preview } : null;
+    const uploadFileSnapshot = previewSnapshot?.uploadFile || null;
+    const questionIds = selectedQuestionIds().slice();
+    if (!previewSnapshot || !confirmRun.checked) return;
     if (!questionIds.length) {
       updateSelectionState("至少選取一題才能開始評測。請先選取題目。" );
       return;
     }
-    if (!window.confirm(`確定開始 ${questionIds.length} 題評測？這會使用既有模型建立對話。`)) return;
-    startButton.disabled = true;
-    setNotice("正在讀取模型與資料快照，尚未送出題目…");
+    startInProgress = true;
+    updateSelectionState();
     try {
+      const beforeStart = await api("/status");
+      const safeSwitch = beforeStart.worker_running === true
+        && beforeStart.can_stop === true
+        && safeRunId(beforeStart.run_id);
+      const confirmation = safeSwitch
+        ? `目前 run ${beforeStart.run_id.slice(0, 8)}… 正在執行。確定先安全停止目前回合、保留舊進度，再開始 ${questionIds.length} 題新評測？`
+        : `確定開始 ${questionIds.length} 題評測？這會使用既有模型建立對話。`;
+      if (!window.confirm(confirmation)) return;
+      if (beforeStart.worker_running) {
+        if (safeSwitch) {
+          setNotice("已要求目前 run 安全停止；等待回合完成後開始新輪…");
+          await api("/stop", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ run_id: beforeStart.run_id }),
+          });
+        } else {
+          setNotice("目前有評測工作正在收尾；等待執行鎖釋放後開始新輪…");
+        }
+        await waitForWorkerIdle();
+      }
+      setNotice("正在讀取模型與資料快照，尚未送出題目…");
       let state;
-      if (selectedSource() === "upload") {
-        const file = preview.uploadFile;
+      if (sourceSnapshot === "upload") {
+        const file = uploadFileSnapshot;
         if (!file) throw new Error("上傳檔案已失效，請重新預覽。");
         state = await api("/start-upload", {
           method: "POST",
           headers: {
             "Content-Type": "text/plain; charset=utf-8",
             "X-Upload-Filename": encodeURIComponent(file.name),
-            "X-Expected-SHA256": preview.sha256,
+            "X-Expected-SHA256": previewSnapshot.sha256,
             "X-Selected-Question-Ids": JSON.stringify(questionIds),
           },
           body: file,
@@ -973,8 +1216,8 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            source: selectedSource(),
-            sha256: preview.sha256,
+            source: sourceSnapshot,
+            sha256: previewSnapshot.sha256,
             question_ids: questionIds,
           }),
         });
@@ -985,13 +1228,20 @@
     } catch (error) {
       setNotice(error.message, true);
       await refresh();
+    } finally {
+      startInProgress = false;
+      updateSelectionState();
     }
   });
 
   stopButton.addEventListener("click", async () => {
     stopButton.disabled = true;
     try {
-      await api("/stop", { method: "POST" });
+      await api("/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: renderedRunId }),
+      });
       setNotice("已要求停止；目前正在進行的回合會安全完成後停下。");
       await refresh();
     } catch (error) {
@@ -1002,7 +1252,11 @@
   resumeButton.addEventListener("click", async () => {
     resumeButton.disabled = true;
     try {
-      await api("/resume", { method: "POST" });
+      await api("/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_id: renderedRunId }),
+      });
       setNotice("已續跑；完成題不會重跑。");
       await refresh();
     } catch (error) {

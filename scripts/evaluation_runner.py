@@ -10,9 +10,15 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from scripts.evaluation_usage import (
+    summarize_attempts,
+    summarize_question,
+    summarize_questions,
+)
 
 
 class EvaluationError(ValueError):
@@ -80,11 +86,6 @@ class OpenWebUIClient(Protocol):
 
 
 _QUESTION_LINE = re.compile(r"(?P<id>\d+): (?P<prompt>.*)")
-_USAGE_KEYS = {
-    "input_tokens": ("input_tokens", "prompt_tokens"),
-    "output_tokens": ("output_tokens", "completion_tokens"),
-    "total_tokens": ("total_tokens",),
-}
 _SENSITIVE_SNAPSHOT_KEYS = {
     "api_key",
     "api-key",
@@ -159,6 +160,18 @@ def select_question_ids(
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def manual_retry_succeeded(question: dict[str, Any]) -> bool:
+    """只投影有明確人工重試紀錄且該回合成功的完成題。"""
+    return question.get("status") == "completed" and any(
+        turn.get("manual_retry") is True
+        and turn.get("kind") == "retry"
+        and isinstance(turn.get("result"), dict)
+        and not turn["result"].get("error")
+        and not turn["result"].get("awaiting_clarification")
+        for turn in question.get("turns", [])
+    )
 
 
 def _elapsed_ms(started_at: str, finished_at: str) -> int:
@@ -281,31 +294,10 @@ def _retryable_result(result: dict[str, Any]) -> bool:
     return not any(result.get(field) for field in ("messages", "tool_calls", "charts"))
 
 
-def _canonical_usage(usage: Any, key: str) -> int | None:
-    if not isinstance(usage, dict):
-        return None
-    for source_key in _USAGE_KEYS[key]:
-        value = usage.get(source_key)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            return value
-    return None
-
-
 def _sum_usage(attempts: list[dict[str, Any]]) -> dict[str, int | None]:
-    """只加總每個回合實際回報的欄位，不由其他欄位推算。"""
+    """保留 checkpoint 舊欄位的嚴格完整語意。"""
 
-    totals: dict[str, int | None] = {}
-    for key in _USAGE_KEYS:
-        values = [
-            _canonical_usage(attempt["result"].get("usage"), key)
-            if attempt.get("result") is not None
-            else None
-            for attempt in attempts
-        ]
-        totals[key] = (
-            sum(values) if values and all(v is not None for v in values) else None
-        )
-    return totals
+    return summarize_attempts(attempts)["token_totals"]
 
 
 class EvaluationRunner:
@@ -313,6 +305,8 @@ class EvaluationRunner:
 
     SCHEMA_VERSION = 1
     FOLDER_ORGANIZATION_VERSION = "openwebui_native_folders_v1"
+    CLARIFICATION_RECOVERY_BACKOFF_INITIAL_SECONDS = 1.0
+    CLARIFICATION_RECOVERY_BACKOFF_MAX_SECONDS = 30.0
 
     def __init__(
         self,
@@ -502,17 +496,39 @@ class EvaluationRunner:
             self._validate_state()
 
     def run_pending(
-        self, *, stop_requested: Callable[[], bool] | None = None
+        self,
+        *,
+        stop_requested: Callable[[], bool] | None = None,
+        at_question_boundary: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        """依序處理待執行題；等待澄清、已完成及失敗題不阻塞其他題。"""
+        """依序處理待執行題，並在題目邊界提供序列工作排程點。"""
 
         with self._lock:
             self._reload_from_store()
-            for question in self._state["questions"]:
+            question_ids = [item["id"] for item in self._state["questions"]]
+            for question_id in question_ids:
                 if stop_requested is not None and stop_requested():
                     break
+                # 邊界 callback 可能透過另一個 runner 更新相同 checkpoint；
+                # 每題重新讀取，避免持有舊 dict 覆寫其更新。
+                self._reload_from_store()
+                question = self._find_question(question_id)
                 if question["status"] not in {"pending", "running"}:
+                    if at_question_boundary is not None:
+                        at_question_boundary()
                     continue
+                self._run_question(question)
+                if at_question_boundary is not None:
+                    at_question_boundary()
+            return self.snapshot()
+
+    def run_queued_question(self, question_id: str) -> dict[str, Any]:
+        """只執行 queue 指定的原題，不掃描同 run 其他待執行題。"""
+
+        with self._lock:
+            self._reload_from_store()
+            question = self._find_question(question_id)
+            if question["status"] in {"pending", "running"}:
                 self._run_question(question)
             return self.snapshot()
 
@@ -680,7 +696,9 @@ class EvaluationRunner:
 
     def _execute_pending_turn(self, question: dict[str, Any]) -> None:
         turn = question["pending_turn"]
-        max_attempts = self._state["manifest"]["max_attempts"]
+        max_attempts = (
+            1 if turn.get("manual_retry") else self._state["manifest"]["max_attempts"]
+        )
         while True:
             attempts = turn["attempts"]
             attempt_to_send = None
@@ -698,15 +716,12 @@ class EvaluationRunner:
                         return
                 elif last.get("error") is not None:
                     if not last.get("recovery_checked", False):
+                        if not self._clarification_recovery_is_due(turn, last):
+                            return
                         recovered, recovery_error = self._recover_turn(question, last)
                         if recovery_error is not None:
-                            question["errors"].append(
-                                {
-                                    "stage": "recover_turn",
-                                    "operation_id": last["operation_id"],
-                                    **recovery_error,
-                                }
-                            )
+                            self._defer_clarification_recovery(turn, last)
+                            self._record_recovery_error(question, last, recovery_error)
                             self._save()
                             return
                         if recovered is not None:
@@ -716,9 +731,12 @@ class EvaluationRunner:
                             last["finished_at"] = _now()
                             last["duration_ms"] = None
                             last["error"] = None
+                            last.pop("recovery_not_before", None)
+                            last.pop("recovery_error", None)
                             self._save()
                             continue
                         last["recovery_checked"] = True
+                        last.pop("recovery_not_before", None)
                         self._save()
                     if len(attempts) >= max_attempts or not last["error"].get(
                         "retryable", False
@@ -728,15 +746,12 @@ class EvaluationRunner:
                     question["retry_count"] += 1
                     self._save()
                 elif last.get("finished_at") is None:
+                    if not self._clarification_recovery_is_due(turn, last):
+                        return
                     recovered, recovery_error = self._recover_turn(question, last)
                     if recovery_error is not None:
-                        question["errors"].append(
-                            {
-                                "stage": "recover_turn",
-                                "operation_id": last["operation_id"],
-                                **recovery_error,
-                            }
-                        )
+                        self._defer_clarification_recovery(turn, last)
+                        self._record_recovery_error(question, last, recovery_error)
                         self._save()
                         return
                     if recovered is not None:
@@ -745,11 +760,14 @@ class EvaluationRunner:
                         last["recovered"] = True
                         last["finished_at"] = _now()
                         last["duration_ms"] = None
+                        last.pop("recovery_not_before", None)
+                        last.pop("recovery_error", None)
                         self._save()
                         continue
                     # client 明確回報尚無完成回合時，以相同 operation_id 再送，
                     # 依 client 契約由 operation_id 防止重複執行。
                     last["recovery_checked"] = True
+                    last.pop("recovery_not_before", None)
                     attempt_to_send = last
                 else:
                     self._finish_turn(question, turn, None)
@@ -813,6 +831,69 @@ class EvaluationRunner:
                 self._finish_turn(question, turn, result)
                 return
 
+    @classmethod
+    def _clarification_recovery_is_due(
+        cls, turn: dict[str, Any], attempt: dict[str, Any]
+    ) -> bool:
+        """佇列補答的不確定回合依持久化時間退避；一般題目維持既有恢復行為。"""
+
+        if turn.get("kind") != "clarification" or not turn.get("queue_id"):
+            return True
+        retry_at = attempt.get("recovery_not_before")
+        if not isinstance(retry_at, str):
+            return True
+        try:
+            retry_time = datetime.fromisoformat(retry_at)
+            if retry_time.tzinfo is None:
+                retry_time = retry_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        return retry_time <= datetime.now(timezone.utc)
+
+    @classmethod
+    def _defer_clarification_recovery(
+        cls, turn: dict[str, Any], attempt: dict[str, Any]
+    ) -> None:
+        if turn.get("kind") != "clarification" or not turn.get("queue_id"):
+            return
+        try:
+            failure_count = max(0, int(attempt.get("recovery_failure_count", 0))) + 1
+        except (TypeError, ValueError):
+            failure_count = 1
+        delay = min(
+            cls.CLARIFICATION_RECOVERY_BACKOFF_MAX_SECONDS,
+            cls.CLARIFICATION_RECOVERY_BACKOFF_INITIAL_SECONDS
+            * (2 ** min(failure_count - 1, 10)),
+        )
+        attempt["recovery_failure_count"] = failure_count
+        attempt["recovery_not_before"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=delay)
+        ).isoformat(timespec="milliseconds")
+
+    @staticmethod
+    def _record_recovery_error(
+        question: dict[str, Any],
+        attempt: dict[str, Any],
+        error: dict[str, Any],
+    ) -> None:
+        operation_id = attempt.get("operation_id")
+        error_type = error.get("type")
+        if any(
+            isinstance(existing, dict)
+            and existing.get("stage") == "recover_turn"
+            and existing.get("operation_id") == operation_id
+            and existing.get("type") == error_type
+            for existing in question["errors"]
+        ):
+            return
+        question["errors"].append(
+            {
+                "stage": "recover_turn",
+                "operation_id": operation_id,
+                **error,
+            }
+        )
+
     def _recover_turn(
         self,
         question: dict[str, Any],
@@ -853,7 +934,17 @@ class EvaluationRunner:
             if isinstance(final_result, dict)
             else None
         )
-        if event_policy and clarification_signal in {
+        if (
+            event_policy
+            and clarification_signal == "event"
+            and final_result
+            and final_result.get("awaiting_clarification")
+        ):
+            # 澄清事件表示題目正在等待補答；保留同回合的分析錯誤於 turn result，
+            # 但不把等待中的題目結案或誤報為分析成功。
+            question["status"] = "awaiting_clarification"
+            question["waiting_since"] = _now()
+        elif event_policy and clarification_signal in {
             "text_candidate",
             "event_conflict",
             "tool_failed",
@@ -917,28 +1008,139 @@ class EvaluationRunner:
             else None
         )
 
-    def submit_clarification(self, question_id: str, answer: str) -> dict[str, Any]:
-        """將使用者補答送回原題 conversation，之後只恢復該題。"""
+    def submit_clarification(
+        self,
+        question_id: str,
+        answer: str,
+        *,
+        queue_id: str | None = None,
+        expected_conversation_id: str | None = None,
+        expected_source_operation_id: str | None = None,
+        submitted_at: str | None = None,
+        allow_legacy_event_conflict: bool = False,
+    ) -> dict[str, Any]:
+        """將補答送回其原澄清對話；佇列呼叫可安全重入及拒絕過期身份。"""
 
         if not isinstance(answer, str) or not answer.strip():
             raise EvaluationError("補答內容不可為空")
         with self._lock:
             self._reload_from_store()
             question = self._find_question(question_id)
-            if question["status"] != "awaiting_clarification":
-                raise EvaluationError(f"題目 {question_id} 目前不等待澄清")
+            if (
+                expected_conversation_id is not None
+                and question.get("conversation_id") != expected_conversation_id
+            ):
+                raise EvaluationError("補答對應的原對話已變更或過期")
+
+            pending = question.get("pending_turn")
+            if (
+                queue_id is not None
+                and question.get("status") == "running"
+                and isinstance(pending, dict)
+                and pending.get("kind") == "clarification"
+                and pending.get("queue_id") == queue_id
+            ):
+                # 上次程序可能在 checkpoint 已保存、佇列尚未確認完成時中斷。
+                self._execute_pending_turn(question)
+                return self.snapshot()
+
+            if queue_id is not None and any(
+                isinstance(turn, dict) and turn.get("queue_id") == queue_id
+                for turn in question.get("turns", [])
+            ):
+                # 已完成回合但佇列項目尚未移除；由 service 完成清理即可。
+                return self.snapshot()
+
+            legacy_projection = (
+                allow_legacy_event_conflict
+                and self._has_legacy_event_conflict_clarification(question)
+            )
+            if question["status"] != "awaiting_clarification" and not legacy_projection:
+                raise EvaluationError("補答對應的澄清已過期或不再等待")
+            turns = question.get("turns")
+            source_turn = turns[-1] if isinstance(turns, list) and turns else None
+            if expected_source_operation_id is not None and (
+                not isinstance(source_turn, dict)
+                or source_turn.get("operation_id") != expected_source_operation_id
+            ):
+                raise EvaluationError("補答對應的澄清回合已變更或過期")
+
+            if legacy_projection:
+                # 僅在實際補答回合即將執行時才遷移狀態；GET/排隊都不寫 checkpoint。
+                question["clarification_legacy_projection"] = "legacy_event_conflict"
+                question.pop("clarification_review_reason", None)
+                question["status"] = "awaiting_clarification"
+
             waiting_since = question.pop("waiting_since", None)
             if waiting_since:
-                question["user_wait_ms"] += _elapsed_ms(waiting_since, _now())
+                wait_end = submitted_at or _now()
+                try:
+                    question["user_wait_ms"] += _elapsed_ms(waiting_since, wait_end)
+                except (TypeError, ValueError):
+                    raise EvaluationError("補答保存時間格式無效") from None
             question["completed_at"] = None
             question["elapsed_ms"] = None
             question["status"] = "running"
-            question["pending_turn"] = self._new_pending_turn(
-                answer, kind="clarification"
-            )
+            pending = self._new_pending_turn(answer, kind="clarification")
+            if queue_id is not None:
+                pending["queue_id"] = queue_id
+            question["pending_turn"] = pending
             self._save()
             self._execute_pending_turn(question)
             return self.snapshot()
+
+    def _has_legacy_event_conflict_clarification(
+        self, question: dict[str, Any]
+    ) -> bool:
+        """確認舊 checkpoint 同一回合有 completed 澄清事件，不猜測回答文字。"""
+
+        if (
+            self._state.get("clarification_policy_version")
+            != "requestClarification-event-v1"
+            or question.get("status") != "needs_review"
+            or isinstance(question.get("pending_turn"), dict)
+        ):
+            return False
+        turns = question.get("turns")
+        if not isinstance(turns, list) or not turns or not isinstance(turns[-1], dict):
+            return False
+        result = turns[-1].get("result")
+        if (
+            not isinstance(result, dict)
+            or result.get("clarification_signal") != "event_conflict"
+        ):
+            return False
+        calls: list[Any] = []
+        tool_calls = result.get("tool_calls")
+        if isinstance(tool_calls, list):
+            calls.extend(tool_calls)
+        messages = result.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    for key in ("tool_calls", "output"):
+                        if isinstance(message.get(key), list):
+                            calls.extend(message[key])
+        for call in calls:
+            if (
+                not isinstance(call, dict)
+                or call.get("name") != "requestClarification"
+                or call.get("status") != "completed"
+            ):
+                continue
+            arguments = call.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    continue
+            if (
+                isinstance(arguments, dict)
+                and isinstance(arguments.get("question"), str)
+                and arguments["question"].strip()
+            ):
+                return True
+        return False
 
     def _find_question(self, question_id: str) -> dict[str, Any]:
         for question in self._state["questions"]:
@@ -946,14 +1148,39 @@ class EvaluationRunner:
                 return question
         raise EvaluationError(f"未知題目 ID：{question_id}")
 
-    def retry_failed(self, question_id: str) -> dict[str, Any]:
-        """明確重試失敗題；沿用原對話並重新送出原題。"""
+    def retry_failed(self, question_id: str, *, execute: bool = True) -> dict[str, Any]:
+        """人工重送最後失敗 request；先確認舊回合不再執行。"""
 
         with self._lock:
             self._reload_from_store()
             question = self._find_question(question_id)
             if question["status"] != "failed":
                 raise EvaluationError(f"題目 {question_id} 不是失敗狀態")
+            if question.get("pending_turn") is not None:
+                raise EvaluationError("舊回合尚待讀回，請先續跑復原")
+            last_turn = question["turns"][-1] if question["turns"] else None
+            if question["conversation_id"] is not None and last_turn is None:
+                raise EvaluationError("無法確認原對話失敗回合，未重送")
+            if question["conversation_id"] is not None and last_turn:
+                idle_check = getattr(self.client, "assert_retry_idle", None)
+                if callable(idle_check):
+                    try:
+                        idle_check(question["conversation_id"])
+                    except Exception:
+                        raise EvaluationError(
+                            "舊回合執行狀態未知或仍執行，未重送"
+                        ) from None
+                attempts = last_turn.get("attempts", [])
+                if not attempts:
+                    raise EvaluationError("無法確認失敗回合的執行狀態")
+                recovered, error = self._recover_turn(question, attempts[-1])
+                if error is not None:
+                    raise EvaluationError("舊回合執行狀態未知或仍執行，未重送")
+                if recovered is not None and not recovered.error:
+                    raise EvaluationError("舊回合已有完成結果，請先讀回復原，未重送")
+            elif any(item.get("uncertain") for item in question.get("errors", [])):
+                raise EvaluationError("對話建立狀態未知，請先讀回復原")
+            question["manual_retry_count"] = question.get("manual_retry_count", 0) + 1
             question["status"] = "running"
             question["completed_at"] = None
             question["elapsed_ms"] = None
@@ -961,18 +1188,24 @@ class EvaluationRunner:
             if question["conversation_id"] is None:
                 question["creation_cycle"] = question.get("creation_cycle", 1) + 1
                 question["status"] = "pending"
-                self._save()
-                self._run_question(question)
-                return self.snapshot()
-            last_turn = question["turns"][-1] if question["turns"] else None
             question["pending_turn"] = self._new_pending_turn(
                 last_turn["request"] if last_turn else question["prompt"],
                 kind="retry",
             )
+            question["pending_turn"]["manual_retry"] = True
             self._save()
-            if self._ensure_conversation(question):
-                self._execute_pending_turn(question)
+            if execute:
+                self._run_question(question)
             return self.snapshot()
+
+    def execute_reserved_retry(self, question_id: str) -> None:
+        """執行已持久保存的人工重試，不連帶重跑其他題。"""
+        with self._lock:
+            self._reload_from_store()
+            question = self._find_question(question_id)
+            if question["status"] not in {"pending", "running"}:
+                raise EvaluationError("人工重試已不在待執行狀態")
+            self._run_question(question)
 
     def summary(self) -> dict[str, Any]:
         """輸出不含題目逐輪細節的彙總統計；token 欄位只加總完整實測值。"""
@@ -983,20 +1216,19 @@ class EvaluationRunner:
             counts: dict[str, int] = {}
             for question in questions:
                 counts[question["status"]] = counts.get(question["status"], 0) + 1
-            token_totals: dict[str, int | None] = {}
-            for key in _USAGE_KEYS:
-                values = [question["usage_totals"].get(key) for question in questions]
-                token_totals[key] = (
-                    sum(values)
-                    if values and all(value is not None for value in values)
-                    else None
-                )
+            usage_summary = summarize_questions(questions)
             return {
                 "run_id": self._state["run_id"],
                 "manifest": _json_copy(self._state["manifest"], label="manifest"),
                 "question_count": len(questions),
                 "status_counts": counts,
-                "token_totals": token_totals,
+                "manual_retry_succeeded_count": sum(
+                    manual_retry_succeeded(q) for q in questions
+                ),
+                "token_totals": usage_summary["token_totals"],
+                "token_observed_totals": usage_summary["observed_totals"],
+                "token_coverage": usage_summary["fields"],
+                "usage_attempt_count": usage_summary["attempt_count"],
                 "questions": [
                     {
                         "id": question["id"],
@@ -1006,6 +1238,13 @@ class EvaluationRunner:
                         "processing_elapsed_ms": question["processing_elapsed_ms"],
                         "user_wait_ms": question["user_wait_ms"],
                         "usage": question["usage_totals"],
+                        "usage_observed_totals": summarize_question(question)[
+                            "observed_totals"
+                        ],
+                        "usage_coverage": summarize_question(question)["fields"],
+                        "usage_attempt_count": summarize_question(question)[
+                            "attempt_count"
+                        ],
                     }
                     for question in questions
                 ],

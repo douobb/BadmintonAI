@@ -67,12 +67,13 @@ def test_compose_has_fixed_services_and_transport_boundaries(tmp_path: Path) -> 
     assert config["name"] == "badminton-ai-v2"
     services = config["services"]
     assert set(services) == {"tool-server", "open-webui"}
+    assert all(service["restart"] == "always" for service in services.values())
 
     tool = services["tool-server"]
     assert tool["image"] == "badminton-ai-tool-server:0.1.0"
     assert tool["build"]["dockerfile"] == "server/Dockerfile"
     assert tool["environment"]["BADMINTON_AI_PLOTLY_ASSET_URL"] == (
-        "http://127.0.0.1:8800/assets/plotly-6.6.0.min.js"
+        "/badmintonai/assets/plotly-6.6.0.min.js"
     )
     assert tool["environment"]["BADMINTON_AI_OPEN_WEBUI_API_KEY"] == (
         "test-only-admin-key"
@@ -94,6 +95,16 @@ def test_compose_has_fixed_services_and_transport_boundaries(tmp_path: Path) -> 
         "/run/secrets/webui_secret_key"
     )
     assert webui["environment"]["CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS"] == "16"
+    assert webui["environment"]["AIOHTTP_CLIENT_TIMEOUT"] == "1200"
+    assert webui["environment"]["AIOHTTP_CLIENT_STREAM_IDLE_TIMEOUT"] == "120"
+    assert webui["environment"]["BADMINTON_AI_STREAM_MODEL_IDS"] == "badmintonai"
+    assert webui["environment"]["BADMINTON_AI_STREAM_TOTAL_SECONDS"] == "180"
+    assert webui["environment"]["BADMINTON_AI_STREAM_NO_DATA_SECONDS"] == "60"
+    assert webui["environment"]["BADMINTON_AI_STREAM_NO_PROGRESS_SECONDS"] == "90"
+    assert (
+        webui["environment"]["BADMINTON_AI_EVALUATION_ADAPTER_WAIT_GRACE_SECONDS"]
+        == "30"
+    )
     assert webui["environment"]["BADMINTON_AI_OPEN_WEBUI_API_KEY"] == (
         "test-only-admin-key"
     )
@@ -114,11 +125,17 @@ def test_compose_has_fixed_services_and_transport_boundaries(tmp_path: Path) -> 
         "/opt/badmintonai-evaluation/scripts/evaluation_runner.py": PROJECT_ROOT
         / "scripts"
         / "evaluation_runner.py",
+        "/opt/badmintonai-evaluation/scripts/evaluation_usage.py": PROJECT_ROOT
+        / "scripts"
+        / "evaluation_usage.py",
         "/opt/badmintonai-evaluation/scripts/evaluation_openwebui_client.py": (
             PROJECT_ROOT / "scripts" / "evaluation_openwebui_client.py"
         ),
         "/opt/badmintonai-evaluation/scripts/evaluation_workbench_service.py": (
             PROJECT_ROOT / "scripts" / "evaluation_workbench_service.py"
+        ),
+        "/opt/badmintonai-evaluation/scripts/html_to_pdf.py": (
+            PROJECT_ROOT / "scripts" / "html_to_pdf.py"
         ),
         "/opt/badmintonai-evaluation/scripts/evaluation_report_html.py": (
             PROJECT_ROOT / "scripts" / "evaluation_report_html.py"
@@ -149,6 +166,37 @@ def test_compose_has_fixed_services_and_transport_boundaries(tmp_path: Path) -> 
     assert len([item for item in webui["volumes"] if item["type"] == "bind"]) == len(
         expected_mounts
     )
+    webui_dockerfile = (PROJECT_ROOT / "openwebui_patch" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS frontend"
+        in webui_dockerfile
+    )
+    assert (
+        "--branch v0.11.3 https://github.com/open-webui/open-webui.git /app"
+        in webui_dockerfile
+    )
+    assert "2a960a59fe1dbbd35282f0556b3666d81102e781" in webui_dockerfile
+    assert "RUN npm ci --force" in webui_dockerfile
+    assert "RUN npm run build" in webui_dockerfile
+    assert "FROM ghcr.io/open-webui/open-webui:v0.11.3 AS runtime" in webui_dockerfile
+    assert "COPY --from=frontend /app/build /app/build" in webui_dockerfile
+    assert (
+        "COPY --from=frontend /app/LICENSE_NOTICE /app/LICENSE_NOTICE"
+        in webui_dockerfile
+    )
+    assert '"playwright==1.63.0"' in webui_dockerfile
+    assert "install --with-deps chromium" in webui_dockerfile
+    assert "fonts-noto-cjk" in webui_dockerfile
+    assert "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright" in webui_dockerfile
+    assert webui_dockerfile.index(
+        "install --with-deps chromium"
+    ) < webui_dockerfile.index("COPY --from=frontend /app/build /app/build")
+    tool_server_dockerfile = (PROJECT_ROOT / "server" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    assert "playwright" not in tool_server_dockerfile.casefold()
     assert not any(
         "BadmintonAI_v2" in str(item["source"])
         and Path(item["source"]).resolve() == PROJECT_ROOT.resolve()

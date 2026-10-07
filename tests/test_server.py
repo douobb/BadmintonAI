@@ -22,11 +22,14 @@ from badminton_ai.data import (
 )
 from badminton_ai.query import BadmintonQueryService
 from badminton_ai.sandbox import (
+    DEFAULT_SANDBOX_IMAGE,
+    DockerSandboxRunner,
     MaterializationManifest,
     SandboxArtifact,
     SandboxCodeError,
     SandboxExecutionError,
     SandboxOutputError,
+    SandboxPolicyError,
     SandboxResult,
     SandboxTimeoutError,
     SandboxUnavailableError,
@@ -34,7 +37,8 @@ from badminton_ai.sandbox import (
 from badminton_ai.server.app import (
     MAX_ANALYSIS_FAILURES_PER_MESSAGE,
     MAX_ANALYSIS_RUNS_PER_MESSAGE,
-    MAX_ARTIFACT_TEXT_PREVIEW_BYTES,
+    MAX_ANALYSIS_TEXT_PREVIEW_BYTES,
+    MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES,
     create_app,
     main,
 )
@@ -48,6 +52,7 @@ from badminton_ai.server.composition import (
     build_services,
 )
 from badminton_ai.server.plotly_rich import PLOTLY_ASSET_PATH
+from badminton_ai.server.result_store import AnalysisResultScope, AnalysisResultStore
 from badminton_ai.settings import AppSettings
 
 
@@ -104,16 +109,43 @@ class _FakeSandbox:
     def __init__(
         self,
         result: SandboxResult | Exception | list[SandboxResult | Exception],
+        render_result: SandboxResult
+        | Exception
+        | list[SandboxResult | Exception]
+        | None = None,
     ) -> None:
         self.result = result
         self.results = list(result) if isinstance(result, list) else None
+        self.render_result = render_result
+        self.render_results = (
+            list(render_result) if isinstance(render_result, list) else None
+        )
         self.calls: list[tuple[BadmintonQueryService, str]] = []
+        self.render_calls: list[tuple[tuple[Any, ...], str, str]] = []
 
     def run(self, query: BadmintonQueryService, code: str) -> SandboxResult:
         self.calls.append((query, code))
         result = self.results.pop(0) if self.results is not None else self.result
         if isinstance(result, Exception):
             raise result
+        return result
+
+    def run_render(
+        self,
+        files: tuple[Any, ...],
+        *,
+        snapshot_id: str,
+        code: str,
+    ) -> SandboxResult:
+        self.render_calls.append((files, snapshot_id, code))
+        if self.render_results is not None:
+            result = self.render_results.pop(0)
+        else:
+            result = self.render_result
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise AssertionError("此測試未設定 render 結果")
         return result
 
 
@@ -171,6 +203,27 @@ def _artifact(
 
 def _result_with_artifacts(*artifacts: SandboxArtifact) -> SandboxResult:
     return SandboxResult("job-1", 0, _result().manifest, tuple(artifacts))
+
+
+def _render_result(*, chart_count: int = 1) -> SandboxResult:
+    charts = json.loads(_plotly_charts_bytes())
+    for index in range(1, chart_count):
+        charts["charts"].append(
+            {
+                "title": f"第 {index + 1} 張",
+                "figure": {
+                    "data": [{"type": "scatter", "x": [1, 2], "y": [2, 1]}],
+                    "layout": {},
+                },
+            }
+        )
+    return _result_with_artifacts(
+        _artifact(
+            "plotly_charts.json",
+            json.dumps(charts, ensure_ascii=False).encode("utf-8"),
+            extension=".json",
+        )
+    )
 
 
 def _chart_spec_bytes(
@@ -241,20 +294,29 @@ def _client(
     sandbox: Any | None = None,
     *,
     chart_bridge: Any | None = None,
+    result_store: AnalysisResultStore | None = None,
 ) -> TestClient:
     query = _query(tmp_path)
     services = ToolServices(
         query=query,
         catalog=BadmintonCatalogService(query),
         sandbox=_FakeSandbox(_result()) if sandbox is None else sandbox,
+        analysis_results=result_store,
     )
-    return TestClient(
+    client = TestClient(
         create_app(
             services,
             chart_bridge=chart_bridge
             or OpenWebUIChartBridge(base_url=None, api_key=None),
         )
     )
+    client.headers.update(
+        {
+            "X-OpenWebUI-Chat-Id": "chat-1",
+            "X-OpenWebUI-User-Id": "admin-1",
+        }
+    )
+    return client
 
 
 def test_openapi_has_clear_tool_operation_ids(tmp_path: Path) -> None:
@@ -274,9 +336,22 @@ def test_openapi_has_clear_tool_operation_ids(tmp_path: Path) -> None:
         "listPlayerCoverage",
         "listMatchCoverage",
         "runPythonAnalysis",
+        "readAnalysisResult",
+        "renderAnalysisChart",
     } <= operations
     assert "/tools/analyze" in schema["paths"]
+    assert "/tools/analysis-result" in schema["paths"]
+    assert "/tools/render-chart" in schema["paths"]
     assert "/tools/request-clarification" in schema["paths"]
+    render_description = schema["paths"]["/tools/render-chart"]["post"]["description"]
+    assert (
+        "embedded 與 duplicate_suppressed 都代表同訊息圖表已發布" in render_description
+    )
+    render_status_description = schema["components"]["schemas"][
+        "RenderAnalysisResponse"
+    ]["properties"]["status"]["description"]
+    assert "duplicate_suppressed" in render_status_description
+    assert "停止重複呼叫並交付" in render_status_description
     assert "ErrorResponse" in schema["components"]["schemas"]
     column_properties = schema["components"]["schemas"]["ColumnSummaryResponse"][
         "properties"
@@ -303,27 +378,21 @@ def test_openapi_has_clear_tool_operation_ids(tmp_path: Path) -> None:
         "pd、np、plt、json、os、Path、resolve_player",
         "resolve_player('周天成')",
         "df.columns 或 BADMINTON_SCHEMA_FILE",
-        "listColumnCatalog",
-        "必要口徑未確認前不要呼叫本工具",
-        "欄位探查先用 listColumnCatalog",
-        "不得以 Python 探查",
+        "澄清前可用 Python 探查／部分分析",
+        "未確認必要口徑不作結論",
+        "pandas/numpy/matplotlib/plotly 已安裝",
+        "SciPy 未裝",
         "BADMINTON_EVENTS_FILE",
         "BADMINTON_MANIFEST_FILE",
         "BADMINTON_METADATA_FILE",
         "BADMINTON_OUTPUT_DIR",
         "Path(os.environ['BADMINTON_OUTPUT_DIR'])",
-        "每次須在 BADMINTON_OUTPUT_DIR 輸出至少一個檔案",
-        "不要先以 print 探查再另呼叫分析",
-        "print 不算產物",
-        "聊天圖表只能用 Plotly",
-        "plt/Matplotlib 產生的 PNG 不會顯示於聊天",
-        "plotly_charts.json",
-        "schema_version='badminton-plotly/v1'",
-        "charts（1–4 個）",
-        "figure=json.loads(fig.to_json())",
-        "不受固定模板限制",
-        "篩選結果為零時不得放寬確認條件湊非零；只輸出摘要，不輸出圖表",
-        "不要另寫 plotly_charts.json 的 Markdown 連結",
+        "正式結果須在 BADMINTON_OUTPUT_DIR 保存至少一個檔案",
+        "短小 print-only 探查可回傳最多 4 KiB stdout",
+        "沒有 result_id、不可繪圖",
+        "只分析並保存可重用的 JSON、CSV 或 JSONL",
+        "不要輸出圖表",
+        "renderAnalysisChart",
     ):
         assert term in analysis_description
 
@@ -332,40 +401,39 @@ def test_openapi_has_clear_tool_operation_ids(tmp_path: Path) -> None:
     analyze_description = schema["paths"]["/tools/analyze"]["post"]["description"]
     assert "完整資料快照、metadata/schema" in analyze_description
     assert "API 程序不直接執行程式碼" in analyze_description
-    artifact_schema = schema["components"]["schemas"]["ArtifactResponse"]
+    clarification_description = schema["paths"]["/tools/request-clarification"]["post"][
+        "description"
+    ]
+    assert "可先以 Python 探查或做不依賴該口徑的部分分析" in clarification_description
+    assert "停止本輪分析" not in clarification_description
+    for concepts in (
+        ("question", "共用", "範圍", "球種", "分母"),
+        ("options", "白話短句", "不同定義", "自行定義", "直接分析"),
+        ("最貼題", "資料支持", "先列", "僅首項", "建議"),
+        ("無合理 proxy", "限制", "明確口徑", "零樣本", "不為", "湊樣本澄清"),
+    ):
+        assert all(concept in clarification_description for concept in concepts)
+    artifact_schema = schema["components"]["schemas"]["AnalysisFileResponse"]
     artifact_properties = artifact_schema["properties"]
-    assert "content_base64" in artifact_properties
-    assert "chart_display_status" in artifact_properties
-    assert "attachment_unknown" in artifact_properties["chart_display_status"]["enum"]
-    assert "rendered_as_rich_ui" in artifact_properties["chart_display_status"]["enum"]
+    assert "content_base64" not in artifact_properties
+    assert "kind" in artifact_properties
     assert "text_preview" in artifact_properties
     assert "preview_truncated" in artifact_properties
-    assert "最多 16 KiB UTF-8" in artifact_properties["text_preview"]["description"]
-    assert "不得推測" in artifact_properties["preview_truncated"]["description"]
     analysis_response = schema["components"]["schemas"]["AnalysisResponse"]
-    assert "rich_ui_status" in analysis_response["properties"]
-    assert "embedded" in analysis_response["properties"]["rich_ui_status"]["enum"]
-    assert (
-        "duplicate_suppressed"
-        in analysis_response["properties"]["rich_ui_status"]["enum"]
-    )
-    assert (
-        "沿用既有圖" in analysis_response["properties"]["rich_ui_status"]["description"]
-    )
-    assert "embed_unknown" in analysis_response["properties"]["rich_ui_status"]["enum"]
-    assert "rich_ui_error" in analysis_response["properties"]
-    assert (
-        "不包含 chart spec 原文、HTML、圖表資料值"
-        in analysis_response["properties"]["rich_ui_error"]["description"]
-    )
-    assert "圖表可選" in analysis_description
-    assert "不可交回 figure JSON 字串、HTML 或 PNG" in analysis_description
-    assert (
-        "只能依可見且未截斷的文字預覽"
-        in schema["components"]["schemas"]["AnalysisResponse"]["properties"][
-            "artifacts"
-        ]["description"]
-    )
+    assert "result_id" in analysis_response["properties"]
+    assert "result_fingerprint" in analysis_response["properties"]
+    assert "analysis_runs_remaining" in analysis_response["properties"]
+    assert "stdout_preview" in analysis_response["properties"]
+    assert "stdout_preview_truncated" in analysis_response["properties"]
+    assert "rich_ui_status" not in analysis_response["properties"]
+    render_description = schema["paths"]["/tools/render-chart"]["post"]["description"]
+    assert "不查詢原始資料 snapshot" in render_description
+    assert "Rich UI" in render_description
+    render_response = schema["components"]["schemas"]["RenderAnalysisResponse"]
+    assert render_response["properties"]["status"]["enum"] == [
+        "embedded",
+        "duplicate_suppressed",
+    ]
     json.dumps(schema, ensure_ascii=False)
 
 
@@ -523,14 +591,178 @@ def test_analysis_forwards_code_and_hides_host_path(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.json()["snapshot_id"] == "sha256:fixture"
     assert response.json()["source"] == "fixture.csv"
-    assert response.json()["rich_ui_status"] == "not_requested"
-    assert response.json()["rich_ui_error"] is None
+    assert len(response.json()["result_id"]) == 48
+    assert len(response.json()["result_fingerprint"]) == 64
+    assert set(response.json()["result_fingerprint"]) <= set("0123456789abcdef")
     assert response.json()["artifacts"][0]["relative_path"] == "summary.json"
     assert str(tmp_path) not in response.text
     assert sandbox.calls[0][1] == "print('ok')"
-    assert response.json()["artifacts"][0]["content_base64"] == base64.b64encode(
-        b"{}"
-    ).decode("ascii")
+    assert response.json()["artifacts"][0]["text_preview"] == "{}"
+    assert "content_base64" not in response.text
+
+
+def test_stdout_only_analysis_is_a_bounded_probe_without_renderable_result(
+    tmp_path: Path,
+) -> None:
+    result = SandboxResult(
+        "probe-1",
+        0,
+        _result().manifest,
+        (),
+        stdout_preview="欄位型別已確認",
+    )
+    client = _client(tmp_path, _FakeSandbox(result))
+
+    response = client.post(
+        "/tools/analyze",
+        json={"code": "print('欄位型別已確認')"},
+        headers=_webui_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["result_id"] is None
+    assert payload["artifacts"] == []
+    assert payload["stdout_preview"] == "欄位型別已確認"
+    assert payload["stdout_preview_truncated"] is False
+    assert list(client.app.state.analysis_result_store.results_root.iterdir()) == []
+    rejected_render = client.post(
+        "/tools/render-chart",
+        json={"result_id": payload["result_id"], "code": "pass"},
+        headers=_webui_headers(),
+    )
+    assert rejected_render.status_code == 422
+
+
+def test_artifact_result_does_not_duplicate_stdout_preview(tmp_path: Path) -> None:
+    result = SandboxResult(
+        "job-1",
+        0,
+        _result().manifest,
+        _result().artifacts,
+        stdout_preview="same summary should not be duplicated",
+        stdout_preview_truncated=True,
+    )
+    response = _client(tmp_path, _FakeSandbox(result)).post(
+        "/tools/analyze", json={"code": "print('same summary')"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stdout_preview"] is None
+    assert response.json()["stdout_preview_truncated"] is False
+
+
+def test_saved_result_fingerprint_is_content_based_and_probe_has_none(
+    tmp_path: Path,
+) -> None:
+    content = b'{"metric":294,"count":248}'
+    sandbox = _FakeSandbox(
+        [
+            _result_with_artifacts(
+                _artifact("summary-a.json", content, extension=".json")
+            ),
+            _result_with_artifacts(
+                _artifact("different-name.json", content, extension=".json")
+            ),
+            _result_with_artifacts(
+                _artifact(
+                    "different-name.json",
+                    b'{"metric":294,"count":247}',
+                    extension=".json",
+                )
+            ),
+            SandboxResult(
+                "probe-1", 0, _result().manifest, (), stdout_preview="探查完成"
+            ),
+        ]
+    )
+    client = _client(tmp_path, sandbox)
+    headers = _webui_headers()
+
+    responses = [
+        client.post(
+            "/tools/analyze", json={"code": f"pass  # {index}"}, headers=headers
+        )
+        for index in range(4)
+    ]
+    assert all(response.status_code == 200 for response in responses)
+    payloads = [response.json() for response in responses]
+    assert payloads[0]["result_fingerprint"] == payloads[1]["result_fingerprint"]
+    assert payloads[0]["result_id"] != payloads[1]["result_id"]
+    assert payloads[0]["result_fingerprint"] != payloads[2]["result_fingerprint"]
+    assert payloads[3]["result_id"] is None
+    assert payloads[3]["result_fingerprint"] is None
+
+
+def test_api_caps_stdout_preview_on_a_utf8_boundary(tmp_path: Path) -> None:
+    result = SandboxResult(
+        "probe-large",
+        0,
+        _result().manifest,
+        (),
+        stdout_preview="拍" * 3000,
+    )
+    response = _client(tmp_path, _FakeSandbox(result)).post(
+        "/tools/analyze", json={"code": "print('large probe')"}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    preview = payload["stdout_preview"]
+    assert len(preview.encode("utf-8")) <= 4 * 1024
+    assert payload["stdout_preview_truncated"] is True
+    assert preview.encode("utf-8").decode("utf-8") == preview
+
+
+def test_stdout_probe_does_not_reset_analysis_repair_failure_count(
+    tmp_path: Path,
+) -> None:
+    probe = SandboxResult(
+        "probe-1",
+        0,
+        _result().manifest,
+        (),
+        stdout_preview="欄位已探查",
+    )
+    sandbox = _FakeSandbox(
+        [
+            SandboxCodeError("分析程式有未定義變數"),
+            probe,
+            SandboxCodeError("分析程式有未定義變數"),
+            SandboxCodeError("分析程式有未定義變數"),
+            SandboxCodeError("分析程式有未定義變數"),
+        ]
+    )
+    client = _client(tmp_path, sandbox)
+
+    first_failure = client.post(
+        "/tools/analyze", json={"code": "broken"}, headers=_webui_headers()
+    )
+    probe_response = client.post(
+        "/tools/analyze", json={"code": "print('probe')"}, headers=_webui_headers()
+    )
+    remaining_failures = [
+        client.post(
+            "/tools/analyze", json={"code": "broken again"}, headers=_webui_headers()
+        )
+        for _ in range(3)
+    ]
+    terminal = client.post(
+        "/tools/analyze", json={"code": "must not run"}, headers=_webui_headers()
+    )
+
+    assert first_failure.json()["code"] == "analysis_code_error"
+    assert probe_response.status_code == 200
+    assert probe_response.json()["analysis_runs_remaining"] == (
+        MAX_ANALYSIS_RUNS_PER_MESSAGE - 2
+    ), "失敗嘗試與 stdout 探查都消耗實際 server 額度"
+    assert all(
+        response.json()["code"] == "analysis_code_error"
+        for response in remaining_failures
+    )
+    assert terminal.status_code == 429
+    assert terminal.json()["code"] == "analysis_retry_limit"
+    assert len(sandbox.calls) == 5
 
 
 @pytest.mark.parametrize(
@@ -541,22 +773,363 @@ def test_analysis_forwards_code_and_hides_host_path(tmp_path: Path) -> None:
         (".csv", "type,count\n發短球,2\n".encode("utf-8")),
     ],
 )
-def test_analysis_text_artifact_has_exact_preview_and_unchanged_base64(
+def test_analysis_previews_small_json_csv_and_jsonl_without_name_convention(
     tmp_path: Path,
     extension: str,
     content: bytes,
 ) -> None:
-    response = _client(
+    filename = {".json": "probe.json", ".jsonl": "probe.jsonl", ".csv": "probe.csv"}[
+        extension
+    ]
+    client = _client(
         tmp_path,
-        _FakeSandbox(_result(content, extension=extension)),
-    ).post("/tools/analyze", json={"code": "pass"})
+        _FakeSandbox(
+            _result_with_artifacts(_artifact(filename, content, extension=extension))
+        ),
+    )
+    response = client.post("/tools/analyze", json={"code": "pass"})
 
     assert response.status_code == 200
     artifact = response.json()["artifacts"][0]
     assert artifact["text_preview"] == content.decode("utf-8")
     assert artifact["preview_truncated"] is False
-    assert artifact["content_base64"] == base64.b64encode(content).decode("ascii")
-    assert artifact["chart_display_status"] == "not_applicable"
+    assert "content_base64" not in response.text
+
+
+def test_analysis_artifact_previews_share_one_total_byte_budget(
+    tmp_path: Path,
+) -> None:
+    client = _client(
+        tmp_path,
+        _FakeSandbox(
+            _result_with_artifacts(
+                _artifact("one.csv", b"A" * 2048, extension=".csv"),
+                _artifact("two.jsonl", b"B" * 2048, extension=".jsonl"),
+                _artifact("three.json", b"C", extension=".json"),
+            )
+        ),
+    )
+
+    response = client.post("/tools/analyze", json={"code": "pass"})
+
+    assert response.status_code == 200
+    artifacts = response.json()["artifacts"]
+    previews = [artifact["text_preview"] for artifact in artifacts]
+    assert previews == ["A" * 2048, "B" * 2047, "C"]
+    assert [artifact["preview_truncated"] for artifact in artifacts] == [
+        False,
+        True,
+        False,
+    ]
+    assert sum(len((preview or "").encode("utf-8")) for preview in previews) == (
+        MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES
+    )
+
+
+def test_small_summary_keeps_preview_when_large_data_file_comes_first(
+    tmp_path: Path,
+) -> None:
+    summary = b'{"total_points":42}'
+    client = _client(
+        tmp_path,
+        _FakeSandbox(
+            _result_with_artifacts(
+                _artifact("data.csv", b"D" * 4096, extension=".csv"),
+                _artifact("summary.json", summary, extension=".json"),
+            )
+        ),
+    )
+
+    response = client.post("/tools/analyze", json={"code": "pass"})
+
+    assert response.status_code == 200
+    artifacts = response.json()["artifacts"]
+    assert [artifact["relative_path"] for artifact in artifacts] == [
+        "data.csv",
+        "summary.json",
+    ]
+    assert artifacts[0]["text_preview"].startswith("D")
+    assert artifacts[0]["preview_truncated"] is True
+    assert artifacts[1]["text_preview"] == summary.decode("utf-8")
+    assert artifacts[1]["preview_truncated"] is False
+    assert (
+        sum(
+            len((artifact["text_preview"] or "").encode("utf-8"))
+            for artifact in artifacts
+        )
+        <= MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES
+    )
+
+
+def test_read_analysis_result_uses_scoped_saved_preview_without_running_analysis(
+    tmp_path: Path,
+) -> None:
+    summary = b'{"total_points":42}'
+    large_data = "拍" * 3000
+    saved_result = _result_with_artifacts(
+        _artifact("data.csv", large_data.encode("utf-8"), extension=".csv"),
+        _artifact("summary.json", summary, extension=".json"),
+    )
+    sandbox = _FakeSandbox([saved_result, SandboxCodeError("analysis failure")])
+    store = AnalysisResultStore(tmp_path / "stored")
+    client = _client(tmp_path, sandbox, result_store=store)
+    headers = _webui_headers()
+
+    created = client.post(
+        "/tools/analyze", json={"code": "save results"}, headers=headers
+    )
+    result_id = created.json()["result_id"]
+    failed = client.post("/tools/analyze", json={"code": "fail once"}, headers=headers)
+    assert failed.status_code == 422
+    runs_before_read = dict(client.app.state.analysis_runs)
+    failures_before_read = dict(client.app.state.analysis_failures)
+
+    response = client.get(
+        "/tools/analysis-result",
+        params={"result_id": result_id},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["result_id"] == result_id
+    assert [item["relative_path"] for item in payload["artifacts"]] == [
+        "data.csv",
+        "summary.json",
+    ]
+    data_preview, summary_preview = payload["artifacts"]
+    assert data_preview["text_preview"].startswith("拍")
+    assert data_preview["preview_truncated"] is True
+    assert (
+        len(data_preview["text_preview"].encode("utf-8"))
+        <= MAX_ANALYSIS_TEXT_PREVIEW_BYTES
+    )
+    assert "�" not in data_preview["text_preview"]
+    assert summary_preview["text_preview"] == summary.decode("utf-8")
+    assert summary_preview["preview_truncated"] is False
+    assert (
+        sum(
+            len((item["text_preview"] or "").encode("utf-8"))
+            for item in payload["artifacts"]
+        )
+        <= MAX_ANALYSIS_TEXT_PREVIEW_TOTAL_BYTES
+    )
+    assert "content_base64" not in response.text
+    assert len(sandbox.calls) == 2
+    assert dict(client.app.state.analysis_runs) == runs_before_read
+    assert dict(client.app.state.analysis_failures) == failures_before_read
+
+    missing_result = client.get(
+        "/tools/analysis-result",
+        params={"result_id": "f" * 48},
+        headers=headers,
+    )
+    assert missing_result.status_code == 404
+    assert missing_result.json()["code"] == "analysis_result_not_found"
+
+    selected = client.get(
+        "/tools/analysis-result",
+        params={"result_id": result_id, "relative_path": "summary.json"},
+        headers=headers,
+    )
+    assert selected.status_code == 200
+    assert [item["relative_path"] for item in selected.json()["artifacts"]] == [
+        "summary.json"
+    ]
+
+    traversal = client.get(
+        "/tools/analysis-result",
+        params={"result_id": result_id, "relative_path": "../summary.json"},
+        headers=headers,
+    )
+    assert traversal.status_code == 404
+    other_user = client.get(
+        "/tools/analysis-result",
+        params={"result_id": result_id},
+        headers={**headers, "X-OpenWebUI-User-Id": "other-user"},
+    )
+    assert other_user.status_code == 404
+    other_chat = client.get(
+        "/tools/analysis-result",
+        params={"result_id": result_id},
+        headers={**headers, "X-OpenWebUI-Chat-Id": "other-chat"},
+    )
+    assert other_chat.status_code == 404
+    invalid_id = client.get(
+        "/tools/analysis-result",
+        params={"result_id": "../manifest.json"},
+        headers=headers,
+    )
+    assert invalid_id.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["small", "A" * 10000, "拍" * 4000, "A" * 4095 + "中🏸" * 1800],
+    ids=["small", "ascii", "cjk", "mixed-boundary"],
+)
+def test_read_analysis_result_segments_reassemble_utf8(
+    tmp_path: Path, text: str
+) -> None:
+    store = AnalysisResultStore(tmp_path / "stored")
+    saved = store.save(
+        scope=AnalysisResultScope(user_id="admin-1", chat_id="chat-1"),
+        snapshot_id="sha256:fixture",
+        artifacts=(_artifact("data.csv", text.encode("utf-8"), extension=".csv"),),
+    )
+    client = _client(tmp_path, result_store=store)
+    offset, segments = 0, []
+    while True:
+        response = client.get(
+            "/tools/analysis-result",
+            params={
+                "result_id": saved.result_id,
+                "relative_path": "data.csv",
+                "offset_bytes": offset,
+            },
+            headers=_webui_headers(),
+        )
+        assert response.status_code == 200
+        item = response.json()["artifacts"][0]
+        segment = item["text_preview"]
+        assert item["preview_offset_bytes"] == offset
+        assert len(segment.encode("utf-8")) <= 4096
+        assert item["next_offset_bytes"] == offset + len(segment.encode("utf-8"))
+        segments.append(segment)
+        offset = item["next_offset_bytes"]
+        assert offset <= len(text.encode("utf-8"))
+        if not item["has_more"]:
+            break
+        assert segment
+    assert "".join(segments) == text
+    eof = client.get(
+        "/tools/analysis-result",
+        params={
+            "result_id": saved.result_id,
+            "relative_path": "data.csv",
+            "offset_bytes": offset,
+        },
+        headers=_webui_headers(),
+    ).json()["artifacts"][0]
+    assert eof["text_preview"] == "" and eof["has_more"] is False
+
+
+@pytest.mark.parametrize(
+    "offset,status",
+    [("-1", 422), ("1.5", 422), ("1.0", 422), ("true", 422), ("1", 400), ("99", 400)],
+)
+def test_read_analysis_result_rejects_invalid_byte_offsets(
+    tmp_path: Path, offset: str, status: int
+) -> None:
+    store = AnalysisResultStore(tmp_path / "stored")
+    saved = store.save(
+        scope=AnalysisResultScope(user_id="admin-1", chat_id="chat-1"),
+        snapshot_id="sha256:fixture",
+        artifacts=(_artifact("data.csv", "中🏸".encode("utf-8"), extension=".csv"),),
+    )
+    client = _client(tmp_path, result_store=store)
+    response = client.get(
+        "/tools/analysis-result",
+        params={
+            "result_id": saved.result_id,
+            "relative_path": "data.csv",
+            "offset_bytes": offset,
+        },
+        headers=_webui_headers(),
+    )
+    assert response.status_code == status
+    assert str(tmp_path) not in response.text
+    missing_path = client.get(
+        "/tools/analysis-result",
+        params={
+            "result_id": saved.result_id,
+            "offset_bytes": 0,
+        },
+        headers=_webui_headers(),
+    )
+    assert missing_path.status_code == 400
+
+
+def test_read_analysis_result_rejects_invalid_utf8(tmp_path: Path) -> None:
+    store = AnalysisResultStore(tmp_path / "stored")
+    saved = store.save(
+        scope=AnalysisResultScope(user_id="admin-1", chat_id="chat-1"),
+        snapshot_id="sha256:fixture",
+        artifacts=(_artifact("data.csv", b"valid\xff", extension=".csv"),),
+    )
+    response = _client(tmp_path, result_store=store).get(
+        "/tools/analysis-result",
+        params={
+            "result_id": saved.result_id,
+            "relative_path": "data.csv",
+        },
+        headers=_webui_headers(),
+    )
+    assert response.status_code == 400
+    assert str(tmp_path) not in response.text
+
+
+def test_read_analysis_result_segment_preserves_scope_and_path_checks(
+    tmp_path: Path,
+) -> None:
+    now = [100.0]
+    store = AnalysisResultStore(
+        tmp_path / "stored", ttl_seconds=10, clock=lambda: now[0]
+    )
+    saved = store.save(
+        scope=AnalysisResultScope(user_id="admin-1", chat_id="chat-1"),
+        snapshot_id="sha256:fixture",
+        artifacts=(_artifact("data.csv", b"abc", extension=".csv"),),
+    )
+    client = _client(tmp_path, result_store=store)
+    params = {
+        "result_id": saved.result_id,
+        "relative_path": "data.csv",
+        "offset_bytes": "1",
+    }
+    for field in ("X-OpenWebUI-User-Id", "X-OpenWebUI-Chat-Id"):
+        response = client.get(
+            "/tools/analysis-result",
+            params=params,
+            headers={**_webui_headers(), field: "other"},
+        )
+        assert response.status_code == 404
+    for path in ("../data.csv", "/data.csv", "data.csv\x00", "missing.csv", "*.csv"):
+        response = client.get(
+            "/tools/analysis-result",
+            params={**params, "relative_path": path},
+            headers=_webui_headers(),
+        )
+        assert response.status_code == 404
+        assert str(tmp_path) not in response.text
+    now[0] = 111.0
+    response = client.get(
+        "/tools/analysis-result", params=params, headers=_webui_headers()
+    )
+    assert response.status_code == 410
+
+
+def test_read_analysis_result_observes_store_ttl(tmp_path: Path) -> None:
+    now = [100.0]
+    store = AnalysisResultStore(
+        tmp_path / "stored", ttl_seconds=10, clock=lambda: now[0]
+    )
+    saved = store.save(
+        scope=AnalysisResultScope(user_id="admin-1", chat_id="chat-1"),
+        snapshot_id="sha256:fixture",
+        artifacts=(_artifact("summary.json", b'{"value":1}', extension=".json"),),
+    )
+    client = _client(tmp_path, result_store=store)
+    now[0] = 111.0
+
+    response = client.get(
+        "/tools/analysis-result",
+        params={"result_id": saved.result_id},
+        headers=_webui_headers(),
+    )
+
+    assert response.status_code == 410
+    assert response.json()["code"] == "analysis_result_expired"
 
 
 def test_analysis_text_preview_is_bounded_at_utf8_boundary(
@@ -565,43 +1138,54 @@ def test_analysis_text_preview_is_bounded_at_utf8_boundary(
     header = '{"value":"'
     content = (
         header.encode("utf-8")
-        + b"A" * (MAX_ARTIFACT_TEXT_PREVIEW_BYTES - len(header.encode("utf-8")) - 1)
+        + b"A" * (MAX_ANALYSIS_TEXT_PREVIEW_BYTES - len(header.encode("utf-8")) - 1)
         + "中".encode("utf-8")
         + b'"}'
     )
-    response = _client(
+    store = AnalysisResultStore(tmp_path / "stored")
+    client = _client(
         tmp_path,
-        _FakeSandbox(_result(content)),
-    ).post("/tools/analyze", json={"code": "pass"})
+        _FakeSandbox(
+            _result_with_artifacts(_artifact("probe.json", content, extension=".json"))
+        ),
+        result_store=store,
+    )
+    response = client.post("/tools/analyze", json={"code": "pass"})
 
     assert response.status_code == 200
     artifact = response.json()["artifacts"][0]
     preview = artifact["text_preview"]
     assert artifact["preview_truncated"] is True
-    assert len(preview.encode("utf-8")) <= MAX_ARTIFACT_TEXT_PREVIEW_BYTES
+    assert len(preview.encode("utf-8")) <= MAX_ANALYSIS_TEXT_PREVIEW_BYTES
     assert preview == header + "A" * (
-        MAX_ARTIFACT_TEXT_PREVIEW_BYTES - len(header.encode("utf-8")) - 1
+        MAX_ANALYSIS_TEXT_PREVIEW_BYTES - len(header.encode("utf-8")) - 1
     )
     assert "�" not in preview
-    assert artifact["content_base64"] == base64.b64encode(content).decode("ascii")
+    assert "content_base64" not in response.text
+    stored = store.get(
+        response.json()["result_id"],
+        scope=AnalysisResultScope("admin-1", "chat-1"),
+    )
+    assert stored.files[0].content == content
 
 
-def test_analysis_without_png_does_not_call_chart_bridge(tmp_path: Path) -> None:
+def test_analysis_never_calls_chart_bridge(tmp_path: Path) -> None:
     class _ForbiddenBridge:
         configured = True
 
-        def attach_pngs(self, *_args: Any, **_kwargs: Any) -> None:
-            raise AssertionError("沒有 PNG 時不可呼叫圖表橋接")
+        def emit_chart_embed(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("分析工具不可直接嵌圖")
 
     response = _client(
         tmp_path,
-        _FakeSandbox(_result(b"{}", extension=".json")),
+        _FakeSandbox(
+            _result_with_artifacts(_artifact("probe.json", b"{}", extension=".json"))
+        ),
         chart_bridge=_ForbiddenBridge(),
     ).post("/tools/analyze", json={"code": "pass"})
 
     assert response.status_code == 200
     artifact = response.json()["artifacts"][0]
-    assert artifact["chart_display_status"] == "not_applicable"
     assert artifact["text_preview"] == "{}"
 
 
@@ -619,11 +1203,8 @@ def test_new_analysis_rejects_png_and_chart_spec_without_attachment(
     class _Bridge:
         configured = True
 
-        def attach_pngs(self, *_args: Any, **_kwargs: Any) -> None:
-            raise AssertionError("新圖不可附加 PNG")
-
         def emit_chart_embed(self, *_args: Any, **_kwargs: Any) -> None:
-            raise AssertionError("舊 chart_spec 不可嵌入")
+            raise AssertionError("分析工具不可直接嵌入圖表")
 
     result = _result_with_artifacts(
         _artifact("chart_spec.json", _chart_spec_bytes(), extension=".json"),
@@ -633,14 +1214,14 @@ def test_new_analysis_rejects_png_and_chart_spec_without_attachment(
     response = _client(tmp_path, _FakeSandbox(result), chart_bridge=_Bridge()).post(
         "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
     )
-    body = response.json()
     assert response.status_code == 200
-    assert body["rich_ui_status"] == "invalid_spec"
-    assert [a["relative_path"] for a in body["artifacts"]] == ["summary.json"]
+    assert [a["relative_path"] for a in response.json()["artifacts"]] == [
+        "summary.json"
+    ]
     assert "summary.png" not in response.text
 
 
-def test_plotly_embeds_multiple_figures_once_and_hides_legacy_outputs(
+def test_renderer_embeds_bundle_once_and_new_message_can_redraw(
     tmp_path: Path,
 ) -> None:
     class _Bridge:
@@ -653,47 +1234,200 @@ def test_plotly_embeds_multiple_figures_once_and_hides_legacy_outputs(
             self.embeds.append(html_content)
             return "embedded"
 
-        def attach_pngs(self, *_args: Any, **_kwargs: Any) -> None:
-            raise AssertionError("不使用 PNG 備援")
-
-    charts = json.loads(_plotly_charts_bytes())
-    charts["charts"].append(
-        {
-            "title": "第二張",
-            "figure": {
-                "data": [{"type": "scatter", "x": [1, 2], "y": [2, 1]}],
-                "layout": {},
-            },
-        }
-    )
     result = _result_with_artifacts(
-        _artifact("plotly_charts.json", json.dumps(charts).encode(), extension=".json"),
+        _artifact("points.csv", b"x,y\n1,2\n", extension=".csv"),
         _artifact("chart_spec.json", _chart_spec_bytes(), extension=".json"),
         _artifact("summary.json", b'{"count":4}', extension=".json"),
         _artifact("summary.png", _valid_png_bytes(), extension=".png"),
     )
-    sandbox = _FakeSandbox(result)
+    sandbox = _FakeSandbox(
+        result,
+        render_result=[_render_result(chart_count=2), _render_result()],
+    )
     bridge = _Bridge()
     client = _client(tmp_path, sandbox, chart_bridge=bridge)
     response = client.post(
         "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
     )
     assert response.status_code == 200
-    assert response.json()["rich_ui_status"] == "embedded"
     assert [a["relative_path"] for a in response.json()["artifacts"]] == [
-        "summary.json"
+        "points.csv",
+        "summary.json",
     ]
+    assert bridge.embeds == []
+    result_id = response.json()["result_id"]
+    rendered = client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "pass"},
+        headers=_webui_headers(),
+    )
+    assert rendered.status_code == 200
+    assert rendered.json() == {
+        "status": "embedded",
+        "result_id": result_id,
+        "chart_count": 2,
+    }
     assert len(bridge.embeds) == 1
     assert bridge.embeds[0].count('class="plotly-figure" data-chart-index=') == 2
+    assert (
+        '<script src="/badmintonai/assets/plotly-6.6.0.min.js"></script>'
+        in (bridge.embeds[0])
+    )
+    assert "127.0.0.1:8000" not in bridge.embeds[0]
     duplicate = client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "raise AssertionError()"},
+        headers=_webui_headers(),
+    )
+    assert duplicate.status_code == 200
+    assert duplicate.json()["status"] == "duplicate_suppressed"
+    assert len(sandbox.render_calls) == 1
+    reanalysis = client.post(
+        "/tools/analyze", json={"code": "another statistic"}, headers=_webui_headers()
+    )
+    assert reanalysis.status_code == 200
+    assert reanalysis.json()["result_id"] != result_id
+    assert len(sandbox.calls) == 2
+    duplicate_after_reanalysis = client.post(
+        "/tools/render-chart",
+        json={
+            "result_id": reanalysis.json()["result_id"],
+            "code": "redraw with new data",
+        },
+        headers=_webui_headers(),
+    )
+    assert duplicate_after_reanalysis.status_code == 200
+    assert duplicate_after_reanalysis.json() == {
+        "status": "duplicate_suppressed",
+        "result_id": result_id,
+        "chart_count": 2,
+    }
+    assert len(sandbox.render_calls) == 1
+    assert len(bridge.embeds) == 1
+    redrawn = client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "pass"},
+        headers=_webui_headers("message-2"),
+    )
+    assert redrawn.status_code == 200
+    assert redrawn.json()["status"] == "embedded"
+    assert len(sandbox.render_calls) == 2
+    assert sandbox.render_calls[0][0][0].relative_path == "points.csv"
+    assert sandbox.render_calls[0][1] == "sha256:fixture"
+    assert sandbox.render_calls[0][2] == "pass"
+    assert len(sandbox.calls) == 2
+
+
+def test_renderer_repair_reuses_saved_result_without_rerunning_analysis(
+    tmp_path: Path,
+) -> None:
+    class _Bridge:
+        configured = True
+
+        def emit_chart_embed(self, *_args: Any, **_kwargs: Any) -> str:
+            return "embedded"
+
+    analysis = _result_with_artifacts(
+        _artifact("points.csv", b"x,y\n1,2\n", extension=".csv"),
+        _artifact("summary.json", b'{"count":1}', extension=".json"),
+    )
+    sandbox = _FakeSandbox(
+        analysis,
+        render_result=[SandboxCodeError("PRIVATE DATA VALUE"), _render_result()],
+    )
+    client = _client(tmp_path, sandbox, chart_bridge=_Bridge())
+    analyzed = client.post(
+        "/tools/analyze", json={"code": "analysis"}, headers=_webui_headers()
+    )
+    result_id = analyzed.json()["result_id"]
+    failed = client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "broken renderer"},
+        headers=_webui_headers(),
+    )
+    assert failed.status_code == 422
+    assert failed.json()["code"] == "render_code_error"
+    assert "PRIVATE DATA VALUE" not in failed.text
+
+    repaired = client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "corrected renderer"},
+        headers=_webui_headers(),
+    )
+    assert repaired.status_code == 200
+    assert repaired.json()["result_id"] == result_id
+    assert len(sandbox.calls) == 1
+    assert [call[2] for call in sandbox.render_calls] == [
+        "broken renderer",
+        "corrected renderer",
+    ]
+    assert sandbox.render_calls[0][0] == sandbox.render_calls[1][0]
+
+
+def test_render_code_error_lists_real_saved_filenames(tmp_path: Path) -> None:
+    analysis = _result_with_artifacts(
+        _artifact("smash_response_summary.json", b'{"count":4}', extension=".json"),
+    )
+    sandbox = _FakeSandbox(
+        analysis,
+        render_result=SandboxCodeError(
+            hint="missing_file",
+            diagnostic={"line": 1, "filename": "smash_response_final.json"},
+            _host_validated=True,
+        ),
+    )
+    client = _client(tmp_path, sandbox)
+    analyzed = client.post(
+        "/tools/analyze", json={"code": "save summary"}, headers=_webui_headers()
+    )
+
+    rendered = client.post(
+        "/tools/render-chart",
+        json={"result_id": analyzed.json()["result_id"], "code": "read final"},
+        headers=_webui_headers(),
+    )
+
+    assert rendered.status_code == 422
+    assert rendered.json()["code"] == "render_code_error"
+    assert rendered.json()["details"]["available_files"] == [
+        "smash_response_summary.json"
+    ]
+    assert "smash_response_final.json" in rendered.json()["message"]
+    assert str(tmp_path) not in rendered.text
+
+
+def test_render_result_is_unavailable_outside_original_chat_scope(
+    tmp_path: Path,
+) -> None:
+    store_root = tmp_path / "persistent-results"
+    store = AnalysisResultStore(store_root)
+    original_client = _client(
+        tmp_path,
+        _FakeSandbox(_result(b'{"count":1}')),
+        result_store=store,
+    )
+    analyzed = original_client.post(
         "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
     )
-    assert duplicate.status_code == 409
-    assert duplicate.json()["code"] == "chart_already_embedded"
-    assert len(sandbox.calls) == 1
+    result_id = analyzed.json()["result_id"]
+
+    reopened_store = AnalysisResultStore(store_root)
+    other_client = _client(
+        tmp_path,
+        _FakeSandbox(_result(), render_result=_render_result()),
+        result_store=reopened_store,
+    )
+    response = other_client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "pass"},
+        headers={**_webui_headers(), "X-OpenWebUI-Chat-Id": "other-chat"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "analysis_result_not_found"
 
 
-def test_zero_event_summary_does_not_embed_chart_or_block_correction(
+def test_zero_event_json_artifact_cannot_be_rendered_without_name_convention(
     tmp_path: Path,
 ) -> None:
     class _Bridge:
@@ -706,55 +1440,100 @@ def test_zero_event_summary_does_not_embed_chart_or_block_correction(
             self.embeds.append(html_content)
             return "embedded"
 
-    first = _result_with_artifacts(
-        _artifact("plotly_charts.json", _plotly_charts_bytes(), extension=".json"),
-        _artifact("summary.json", b'{"event_count":0}', extension=".json"),
+    analysis = _result_with_artifacts(
+        _artifact("probe.json", b'{"event_count":0}', extension=".json"),
     )
-    corrected = _result_with_artifacts(
-        _artifact("plotly_charts.json", _plotly_charts_bytes(), extension=".json"),
-        _artifact("summary.json", b'{"event_count":4}', extension=".json"),
-    )
-    sandbox = _FakeSandbox([first, corrected])
+    sandbox = _FakeSandbox(analysis, render_result=_render_result())
     bridge = _Bridge()
     client = _client(tmp_path, sandbox, chart_bridge=bridge)
 
-    empty = client.post(
+    analyzed = client.post(
         "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
     )
-    assert empty.status_code == 200
-    assert empty.json()["rich_ui_status"] == "invalid_spec"
-    assert "event_count 為 0" in empty.json()["rich_ui_error"]
+    assert analyzed.status_code == 200
+    rendered = client.post(
+        "/tools/render-chart",
+        json={"result_id": analyzed.json()["result_id"], "code": "pass"},
+        headers=_webui_headers(),
+    )
+    assert rendered.status_code == 422
+    assert rendered.json()["code"] == "render_invalid_spec"
     assert bridge.embeds == []
-
-    retry = client.post(
-        "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
-    )
-    assert retry.status_code == 200
-    assert retry.json()["rich_ui_status"] == "embedded"
-    assert len(bridge.embeds) == 1
-    assert len(sandbox.calls) == 2
+    assert len(sandbox.calls) == 1
+    assert len(sandbox.render_calls) == 1
 
 
 def test_invalid_plotly_has_no_png_fallback_and_preserves_summary(
     tmp_path: Path,
 ) -> None:
-    result = _result_with_artifacts(
-        _artifact(
-            "plotly_charts.json", _plotly_charts_bytes(valid=False), extension=".json"
-        ),
+    analysis = _result_with_artifacts(
         _artifact("summary.json", b'{"count":4}', extension=".json"),
         _artifact("summary.png", _valid_png_bytes(), extension=".png"),
     )
-    response = _client(tmp_path, _FakeSandbox(result)).post(
+    sandbox = _FakeSandbox(
+        analysis,
+        render_result=_result_with_artifacts(
+            _artifact(
+                "plotly_charts.json",
+                _plotly_charts_bytes(valid=False),
+                extension=".json",
+            )
+        ),
+    )
+    client = _client(tmp_path, sandbox)
+    analyzed = client.post(
         "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
     )
-    body = response.json()
-    assert response.status_code == 200
-    assert body["rich_ui_status"] == "invalid_spec"
-    assert [a["relative_path"] for a in body["artifacts"]] == ["summary.json"]
+    rendered = client.post(
+        "/tools/render-chart",
+        json={"result_id": analyzed.json()["result_id"], "code": "pass"},
+        headers=_webui_headers(),
+    )
+    assert rendered.status_code == 422
+    assert rendered.json()["code"] == "render_invalid_spec"
+    assert "summary.png" not in analyzed.text
 
 
-def test_unknown_embed_blocks_reanalysis_to_avoid_duplicate_chart(
+def test_invalid_chart_wrapper_names_contract_and_preserves_result_id(
+    tmp_path: Path,
+) -> None:
+    analysis = _result_with_artifacts(
+        _artifact("stats.json", b'{"metric":294}', extension=".json")
+    )
+    invalid_chart_payload = {
+        "schema_version": "badminton-plotly/v1",
+        "charts": [{"figure": {"data": [{"type": "bar", "x": ["A"], "y": [1]}]}}],
+    }
+    render = _result_with_artifacts(
+        _artifact(
+            "plotly_charts.json",
+            json.dumps(invalid_chart_payload).encode("utf-8"),
+            extension=".json",
+        )
+    )
+    sandbox = _FakeSandbox(analysis, render_result=render)
+    client = _client(tmp_path, sandbox)
+    headers = _webui_headers()
+    analyzed = client.post("/tools/analyze", json={"code": "pass"}, headers=headers)
+    result_id = analyzed.json()["result_id"]
+
+    rendered = client.post(
+        "/tools/render-chart",
+        json={"result_id": result_id, "code": "# 修正 charts wrapper"},
+        headers=headers,
+    )
+
+    assert rendered.status_code == 422
+    error = rendered.json()
+    assert error["code"] == "render_invalid_spec"
+    assert "每個 charts 元素必須恰為 {title, figure}" in error["message"]
+    assert error["details"]["result_id"] == result_id
+    assert error["details"]["attempt"] == 1
+    assert len(sandbox.calls) == 1, "繪圖契約失敗後沿用分析結果，只修繪圖程式"
+    assert len(sandbox.render_calls) == 1
+
+
+def test_unknown_embed_blocks_renderer_replay_not_new_analysis(
     tmp_path: Path,
 ) -> None:
     class _Bridge:
@@ -764,22 +1543,30 @@ def test_unknown_embed_blocks_reanalysis_to_avoid_duplicate_chart(
             raise OpenWebUIEventOutcomeUnknown("private event response")
 
     result = _result_with_artifacts(
-        _artifact("plotly_charts.json", _plotly_charts_bytes(), extension=".json"),
         _artifact("summary.json", b'{"count":4}', extension=".json"),
     )
-    sandbox = _FakeSandbox(result)
+    sandbox = _FakeSandbox(result, render_result=_render_result())
     client = _client(tmp_path, sandbox, chart_bridge=_Bridge())
-    first = client.post(
+    analyzed = client.post(
         "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
     )
-    assert first.status_code == 200
-    assert first.json()["rich_ui_status"] == "embed_unknown"
+    assert analyzed.status_code == 200
+    first = client.post(
+        "/tools/render-chart",
+        json={"result_id": analyzed.json()["result_id"], "code": "pass"},
+        headers=_webui_headers(),
+    )
+    assert first.status_code == 409
+    assert first.json()["code"] == "chart_state_unknown"
     second = client.post(
-        "/tools/analyze", json={"code": "pass"}, headers=_webui_headers()
+        "/tools/render-chart",
+        json={"result_id": analyzed.json()["result_id"], "code": "pass"},
+        headers=_webui_headers(),
     )
     assert second.status_code == 409
     assert second.json()["code"] == "chart_state_unknown"
     assert len(sandbox.calls) == 1
+    assert len(sandbox.render_calls) == 1
 
 
 def test_analysis_allows_multi_step_successes_and_stops_at_message_run_limit(
@@ -794,6 +1581,9 @@ def test_analysis_allows_multi_step_successes_and_stops_at_message_run_limit(
             headers=_webui_headers(),
         )
         assert response.status_code == 200
+        assert response.json()["analysis_runs_remaining"] == (
+            MAX_ANALYSIS_RUNS_PER_MESSAGE - index - 1
+        )
     assert len(sandbox.calls) == MAX_ANALYSIS_RUNS_PER_MESSAGE
 
     for _ in range(5):
@@ -806,6 +1596,7 @@ def test_analysis_allows_multi_step_successes_and_stops_at_message_run_limit(
             "runs": MAX_ANALYSIS_RUNS_PER_MESSAGE,
             "max_runs": MAX_ANALYSIS_RUNS_PER_MESSAGE,
             "terminal": True,
+            "analysis_runs_remaining": 0,
         }
     assert len(sandbox.calls) == MAX_ANALYSIS_RUNS_PER_MESSAGE
 
@@ -830,6 +1621,8 @@ def test_analysis_retry_limit_is_for_consecutive_failures_only(tmp_path: Path) -
             "failed_attempts": MAX_ANALYSIS_FAILURES_PER_MESSAGE,
             "max_failed_attempts": MAX_ANALYSIS_FAILURES_PER_MESSAGE,
             "terminal": True,
+            "analysis_runs_remaining": MAX_ANALYSIS_RUNS_PER_MESSAGE
+            - MAX_ANALYSIS_FAILURES_PER_MESSAGE,
         }
     assert len(sandbox.calls) == MAX_ANALYSIS_FAILURES_PER_MESSAGE
 
@@ -888,7 +1681,10 @@ def test_infrastructure_failure_terminates_later_analysis_for_message(
     )
 
     assert first.status_code == status
-    assert first.json()["details"] == {"terminal": True}
+    assert first.json()["details"] == {
+        "terminal": True,
+        "analysis_runs_remaining": MAX_ANALYSIS_RUNS_PER_MESSAGE - 1,
+    }
     assert second.status_code == 409
     assert second.json()["code"] == "analysis_terminated"
     assert next_message.status_code == 200
@@ -980,11 +1776,27 @@ def test_sandbox_errors_use_stable_error_contract(
             "sandbox_unavailable": "分析 sandbox 目前不可用",
             "sandbox_timeout": "分析執行超過時間上限",
             "sandbox_execution_failure": "分析 sandbox 執行失敗",
-            "analysis_code_error": "分析程式有未定義變數",
-            "analysis_output_error": "分析沒有產生檔案；請在 BADMINTON_OUTPUT_DIR 寫入至少一個檔案（例如 summary.json），print 輸出不算產物",
+            "analysis_code_error": "Python 程式使用未定義名稱；請核對變數與 import 後重試",
+            "analysis_output_error": "分析沒有產生可重用檔案；正式結果請在 BADMINTON_OUTPUT_DIR 保存 JSON、CSV 或 JSONL，stdout-only 探查不能供繪圖",
         }[code],
         "details": None,
     }
+
+
+def test_sandbox_code_error_does_not_echo_untrusted_exception_text(
+    tmp_path: Path,
+) -> None:
+    client = _client(
+        tmp_path,
+        _FakeSandbox(SandboxCodeError("PRIVATE /host/path api_key=secret")),
+    )
+
+    response = client.post("/tools/analyze", json={"code": "pass"})
+
+    assert response.status_code == 422
+    assert "PRIVATE" not in response.text
+    assert "/host/path" not in response.text
+    assert "api_key" not in response.text
 
 
 def test_other_output_errors_keep_generic_message_without_internal_paths(
@@ -1045,12 +1857,59 @@ def test_composition_loads_only_source_directory_data(tmp_path: Path) -> None:
 
     assert services.query.snapshot.row_count == 1
     assert services.query.snapshot.source == data_file.resolve()
+    assert services.analysis_results is not None
+    assert services.analysis_results.root == (tmp_path / "runtime" / "analysis-results")
 
     with pytest.raises(CompositionError):
         build_services(
             settings,
             data_file=tmp_path / "outside.csv",
             sandbox=fake_sandbox,  # type: ignore[arg-type]
+        )
+
+
+def test_composition_uses_optional_validated_sandbox_image_override(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    data_file = source_dir / "events.csv"
+    data_file.write_text(
+        ",".join(MVP_REQUIRED_COLUMNS)
+        + "\n"
+        + ",".join(str(_row()[column]) for column in MVP_REQUIRED_COLUMNS)
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = AppSettings("test", source_dir, tmp_path / "runtime")
+    image = "badmintonai-sandbox:diagnostics-20261003"
+
+    services = build_services(
+        settings,
+        data_file=Path("events.csv"),
+        environ={
+            "BADMINTON_AI_SANDBOX_IMAGE": image,
+            "BADMINTON_AI_ANALYSIS_RESULTS_DIR": str(tmp_path / "saved-results"),
+        },
+    )
+    assert isinstance(services.sandbox, DockerSandboxRunner)
+    assert services.sandbox.policy.image == image
+    assert services.analysis_results is not None
+    assert services.analysis_results.root == (tmp_path / "saved-results")
+
+    default_services = build_services(
+        settings,
+        data_file=Path("events.csv"),
+        environ={},
+    )
+    assert isinstance(default_services.sandbox, DockerSandboxRunner)
+    assert default_services.sandbox.policy.image == DEFAULT_SANDBOX_IMAGE
+
+    with pytest.raises(SandboxPolicyError):
+        build_services(
+            settings,
+            data_file=Path("events.csv"),
+            environ={"BADMINTON_AI_SANDBOX_IMAGE": "badmintonai-sandbox:latest"},
         )
 
 

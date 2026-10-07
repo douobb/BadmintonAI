@@ -110,6 +110,7 @@ Invoke-RestMethod http://localhost:8000/health
 
 1. **設定模型供應商**：到管理設定中的 Connections，新增所使用的模型供應商連線，填入供應商提供的 API URL、API key，並確認至少有一個可用的基礎模型。這把模型供應商 API key 存在 Open WebUI，不要填入專案 `.env`。
 2. **連接 Tool Server**：在 Connections 新增 OpenAPI Server，URL 填 `http://tool-server:8000/openapi.json`。這是 Compose 網路內的服務名稱；不要在容器連線設定中改成 `localhost:8000`。儲存後確認 Open WebUI 已讀取工具清單。
+   若既有 OpenAPI 連線設有 `function_name_filter_list`，須將 `renderAnalysisChart` 明確加入允許清單並重新載入該模型工具；新增 OpenAPI route 不會自動修改既有 allowlist。其他既有工具名稱請保留。
 3. **匯入 Skill**：到 Workspace > Skills，使用匯入功能選擇 `skills/badminton-analysis.md`。該 Markdown 沒有 YAML frontmatter，因此匯入後需在介面補上名稱與描述並儲存。
 4. **建立 Knowledge**：到 Workspace > Knowledge 建立一個羽球分析知識庫，分別上傳：
    - `knowledge/badminton-terminology.md`
@@ -119,29 +120,44 @@ Invoke-RestMethod http://localhost:8000/health
    等待文件處理完成。`knowledge/court-zones.json` 是程式使用的機器可讀檔，不是一般聊天知識文件的必要上傳項目。
 5. **建立 BadmintonAI 模型**：到 Workspace > Models 建立模型，名稱可用 `BadmintonAI`，模型 ID 必須是 `badmintonai`（評測工作台使用此 ID）。選擇剛設定的基礎模型，將 `prompts/badmintonai-system.md` 的內容貼入系統提示詞，並綁定剛建立的 Skill、Knowledge，以及 Tool Server 提供的必要工具。基礎模型須支援可靠的工具呼叫，否則模型可能不會正確使用資料分析工具。
 
+獨立繪圖工具需要新版 sandbox bootstrap。公開 pinned GHCR digest 尚未包含此版本；啟用 renderer 前，請在專案根目錄建置本機固定 tag，並在私有 `.env` 設定 `BADMINTON_AI_SANDBOX_IMAGE=badmintonai-sandbox:analysis-render-20261003`：
+
+```powershell
+docker build -f sandbox/Dockerfile -t badmintonai-sandbox:analysis-render-20261003 .
+docker compose up -d tool-server
+```
+
+這項本機 override 只影響 Compose 啟動的 Tool Server，不會發布 GHCR image；公開 digest 需另行建置、驗證與發布。
+
 Open WebUI 的操作名稱會隨版本略有不同；可參考官方文件：[Models](https://docs.openwebui.com/features/workspace/models/)、[Skills](https://docs.openwebui.com/features/workspace/skills/)、[Knowledge](https://docs.openwebui.com/features/workspace/knowledge/) 與 [OpenAPI Servers](https://docs.openwebui.com/features/extensibility/plugin/tools/openapi-servers/)。
 
 重要：`skills/`、`knowledge/`、`prompts/` 是可供管理員匯入或複製的來源文件。Compose 不會替你建立模型、匯入內容或綁定工具；請確認模型已綁定三者，否則對話不會自動使用它們。
 
-## 6. 選用：啟用評測工作台與聊天室圖表附件
+## 6. 選用：啟用評測工作台、聊天室圖表附件與對話匯出
 
-評測工作台呼叫 Open WebUI API，聊天室圖表也會使用該 API 將圖表附件存回對話。若要使用這些功能：
+同站 API 由 Event Function 註冊。先匯入並啟用 Event Function，工作台及原生聊天列表下載選單才會有對應 API。聊天匯出不需管理員 API key；該 key 只用於評測工作台和圖表附件持久化。
 
-1. 登入 Open WebUI，從實際操作評測工作台及發問的帳號建立 API key（帳號設定中的 API key 管理）。
-2. 將 key 放入本機 `.env`，取消註解並填入真實值：
+1. 管理員到 Workspace > Functions 匯入並啟用 `openwebui_functions/evaluation_workbench_event.py` Event Function。它會註冊管理員評測工作台及同站聊天匯出 API。
+2. **只有要使用評測工作台或將聊天室圖表附件透過 API 存回對話時**，才需設定 Open WebUI API key：
+   1. 登入 Open WebUI，從實際操作評測工作台及圖表附件功能的帳號建立 API key（帳號設定中的 API key 管理）。
+   2. 將 key 放入本機 `.env`，取消註解並填入真實值：
 
-   ```dotenv
-   BADMINTON_AI_OPEN_WEBUI_API_KEY=在此填入你建立的API金鑰
-   ```
+      ```dotenv
+      BADMINTON_AI_OPEN_WEBUI_API_KEY=在此填入你建立的API金鑰
+      ```
 
-3. 儲存 `.env` 後，在專案根目錄執行 `docker compose up -d`，讓服務載入新環境變數。
-4. 管理員可開啟 [評測工作台](http://localhost:3000/badmintonai/evaluation)。
+   3. 儲存 `.env` 後，在專案根目錄執行 `docker compose up -d`，讓服務載入新環境變數。
+3. 若已設定 API key，管理員可開啟 [評測工作台](http://localhost:3000/badmintonai/evaluation)。
+4. 聊天匯出不需額外匯入 Action。建立或開啟已儲存的聊天後，在聊天列表該對話的「⋯ → 下載」選擇 PDF 或互動 HTML；選單以對話 ID 下載完整已儲存分支，並依登入者的 Open WebUI 匯出權限與對話擁有權授權，不會更動原訊息或圖表附件。尚未儲存的對話不提供匯出。
+
+聊天與評測 PDF 共用 Open WebUI 映像內的 Chromium renderer；Dockerfile 會安裝 Playwright Chromium 與 Noto CJK 字型，Tool Server 不會安裝這些 PDF 依賴。更新程式碼後以 `docker compose up -d --build open-webui` 重建該服務，再測試一段含多輪對話及圖表的聊天與評測報告。若圖表未完成渲染或產生逾時，下載 API 會回報錯誤，不會提供缺圖的 PDF。
 
 ## 7. 驗證安裝
 
 - 在 Open WebUI 模型選單選擇 `BadmintonAI`，詢問一個簡單的資料摘要問題，確認模型有使用 Tool Server 回答。
 - 再試一個需要分類比較或空間分布的問題，確認 Python 分析可以執行，互動圖表能呈現在聊天室。
 - 若已設定 API key，開啟評測工作台，預覽題庫並只選少量題目做首次測試。
+- 在一個已儲存、含多輪內容或 Plotly 圖表的聊天中，從聊天列表的「⋯ → 下載」分別下載 PDF 與互動 HTML，確認下載完整對話、PDF 有中文字與完整圖表、HTML 可互動，且原訊息的圖表仍保留。新環境可先用自己的測試對話，不需重新執行評測或模型。
 
 ## 日常啟動與停止
 

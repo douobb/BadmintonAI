@@ -114,6 +114,28 @@ def test_q3_shape_markdown_and_plotly_chart_are_both_preserved(monkeypatch) -> N
     assert '<html lang="zh-Hant" data-theme="auto">' in document
 
 
+def test_export_hides_only_an_injected_empty_root_iframe(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.export_chat_html._plotly_javascript", lambda: "/* bundled */"
+    )
+    payload = _chat(embed=_embed(_chart("保留的圖表")))
+    document, _, charts, warnings = build_chat_export_html(payload)
+    injected_frame = '<html lang="zh-Hant" data-theme="light">\n<iframe></iframe>\n'
+    simulated_browser_document = document.replace(
+        '<html lang="zh-Hant" data-theme="light">\n', injected_frame, 1
+    )
+    stylesheet = document.partition("<style>\n")[2].partition("</style>")[0]
+
+    assert (charts, warnings) == (1, 0)
+    assert simulated_browser_document.startswith(f"<!doctype html>\n{injected_frame}")
+    assert (
+        "html > iframe:empty:not([src]):not([srcdoc]) { display: none !important; }"
+    ) in stylesheet
+    assert "iframe { display: none" not in stylesheet
+    assert 'class="chart" id="chart-0"' in simulated_browser_document
+    assert ".chart { min-height: 300px; width: 100%; }" in stylesheet
+
+
 def test_non_native_figure_requires_explicit_structural_validation_opt_in(
     monkeypatch,
 ) -> None:

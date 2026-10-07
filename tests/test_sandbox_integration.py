@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import subprocess
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -22,12 +23,25 @@ from badminton_ai.sandbox import (
     DEFAULT_SANDBOX_IMAGE,
     DockerSandboxRunner,
     SandboxArtifactError,
+    SandboxCodeError,
     SandboxExecutionError,
+    SandboxInputFile,
     SandboxOutputError,
     SandboxPolicy,
     SandboxTimeoutError,
     SnapshotMaterializer,
+    sandbox_code_error_message,
 )
+
+
+def _test_sandbox_image() -> str:
+    """只供 integration tests 覆寫成已建置的本機固定 tag。"""
+
+    return os.environ.get("BADMINTON_AI_TEST_SANDBOX_IMAGE", DEFAULT_SANDBOX_IMAGE)
+
+
+def _test_policy(**overrides: Any) -> SandboxPolicy:
+    return SandboxPolicy(image=_test_sandbox_image(), **overrides)
 
 
 def _runtime_available() -> bool:
@@ -42,7 +56,7 @@ def _runtime_available() -> bool:
             timeout=5,
         )
         image = subprocess.run(
-            ["docker", "image", "inspect", DEFAULT_SANDBOX_IMAGE],
+            ["docker", "image", "inspect", _test_sandbox_image()],
             capture_output=True,
             check=False,
             text=True,
@@ -122,7 +136,7 @@ def _run(
     rows: tuple[dict[str, Any], ...] | None = None,
 ) -> Any:
     runner = DockerSandboxRunner(
-        policy=policy,
+        policy=policy or _test_policy(),
         materializer=SnapshotMaterializer(tmp_path),
     )
     return runner.run(_query(tmp_path, rows), code)
@@ -152,6 +166,99 @@ with output.joinpath('summary.csv').open('w', newline='') as handle:
 
     assert json.loads(_artifact_bytes(result, "summary.json")) == {"events": 3}
     assert _artifact_bytes(result, "summary.csv").splitlines() == [b"events", b"3"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_real_analysis_artifacts_render_bar_and_heatmap_without_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = tuple(
+        {**_row(index, shot_type), "landing_area": str(zone)}
+        for index, (shot_type, zone) in enumerate(
+            (("發短球", 1), ("殺球", 2), ("平球", 5), ("殺球", 24)),
+            start=1,
+        )
+    )
+    runner = DockerSandboxRunner(
+        policy=_test_policy(timeout_seconds=60),
+        materializer=SnapshotMaterializer(tmp_path),
+    )
+    query = _query(tmp_path, rows)
+    analysis = runner.run(
+        query,
+        """
+import json, os
+from pathlib import Path
+
+output = Path(os.environ['BADMINTON_OUTPUT_DIR'])
+points = df[['type', 'landing_area']]
+points.to_csv(output / 'points.csv', index=False)
+(output / 'summary.json').write_text(
+    json.dumps({'event_count': len(points)}), encoding='utf-8'
+)
+""".lstrip(),
+    )
+    assert json.loads(_artifact_bytes(analysis, "summary.json")) == {"event_count": 4}
+    point_bytes = _artifact_bytes(analysis, "points.csv")
+    assert point_bytes.decode("utf-8").splitlines()[0] == "type,landing_area"
+
+    # Renderer 只能收到分析時明確保存的檔案；若意外重新查詢 snapshot，測試立即失敗。
+    def reject_snapshot_read(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("render 不得重新查詢原始 snapshot")
+
+    monkeypatch.setattr(query, "query_events", reject_snapshot_read)
+    rendered = runner.run_render(
+        (
+            SandboxInputFile("points.csv", point_bytes),
+            SandboxInputFile("summary.json", _artifact_bytes(analysis, "summary.json")),
+        ),
+        snapshot_id=analysis.manifest.snapshot_id,
+        code="""
+import json, os
+from pathlib import Path
+import plotly.express as px
+import plotly.graph_objects as go
+import pandas as pd
+
+assert 'df' not in globals()
+assert 'events' not in globals()
+assert 'resolve_player' not in globals()
+if 'BADMINTON_EVENTS_FILE' in os.environ:
+    assert not Path(os.environ['BADMINTON_EVENTS_FILE']).exists()
+
+points = pd.read_csv(Path(results_dir) / 'points.csv')
+bar_counts = points.groupby('type', sort=True).size()
+bar = px.bar(x=bar_counts.index.tolist(), y=bar_counts.tolist())
+zone_counts = points['landing_area'].astype(int).value_counts()
+matrix = [
+    [int(zone_counts.get(row * 4 + column + 1, 0)) for column in range(4)]
+    for row in range(6)
+]
+heatmap = go.Figure(
+    data=[go.Heatmap(z=matrix, x=[1, 2, 3, 4], y=[1, 2, 3, 4, 5, 6])]
+)
+charts = [
+    {'title': '球路次數', 'figure': json.loads(bar.to_json())},
+    {'title': '落點熱區', 'figure': json.loads(heatmap.to_json())},
+]
+Path(output_dir, 'plotly_charts.json').write_text(
+    json.dumps(
+        {'schema_version': 'badminton-plotly/v1', 'charts': charts},
+        ensure_ascii=False,
+        allow_nan=False,
+    ),
+    encoding='utf-8',
+)
+""".lstrip(),
+    )
+
+    payload = json.loads(_artifact_bytes(rendered, "plotly_charts.json"))
+    assert payload["schema_version"] == "badminton-plotly/v1"
+    assert [chart["title"] for chart in payload["charts"]] == ["球路次數", "落點熱區"]
+    bar_chart, heatmap_chart = [chart["figure"] for chart in payload["charts"]]
+    assert bar_chart["data"][0]["type"] == "bar"
+    assert heatmap_chart["data"][0]["type"] == "heatmap"
+    assert heatmap_chart["data"][0]["z"][0][:2] == [1, 1]
     assert not list(tmp_path.iterdir())
 
 
@@ -304,7 +411,7 @@ Path(os.environ['BADMINTON_OUTPUT_DIR'], 'data.json').write_text(json.dumps({
     'line': sys._getframe().f_lineno,
 }))
 """.lstrip(),
-        policy=SandboxPolicy(),
+        policy=_test_policy(),
         rows=rows,
     )
 
@@ -364,7 +471,7 @@ def test_real_basic_artifact_limit(tmp_path: Path) -> None:
         _run(
             tmp_path,
             "import os\nfrom pathlib import Path\nPath(os.environ['BADMINTON_OUTPUT_DIR'], 'result.json').write_text('12345')",
-            policy=SandboxPolicy(max_output_total_bytes=4),
+            policy=_test_policy(max_output_total_bytes=4),
         )
 
 
@@ -377,7 +484,7 @@ def test_real_timeout_removes_exact_container(tmp_path: Path) -> None:
 
     with pytest.raises(SandboxTimeoutError):
         DockerSandboxRunner(
-            policy=SandboxPolicy(timeout_seconds=2),
+            policy=_test_policy(timeout_seconds=2),
             materializer=SnapshotMaterializer(tmp_path),
             process_runner=recording_process,
         ).run(
@@ -406,4 +513,26 @@ def test_real_timeout_removes_exact_container(tmp_path: Path) -> None:
     )
     assert inspection.returncode == 0
     assert inspection.stdout.strip() == ""
+    assert not list(tmp_path.iterdir())
+
+
+def test_real_sandbox_safe_module_and_dynamic_key_diagnostics(tmp_path: Path) -> None:
+    with pytest.raises(SandboxCodeError) as missing_module:
+        _run(tmp_path, "import scipy.stats")
+    missing_module_message = sandbox_code_error_message(missing_module.value)
+    assert "scipy" in missing_module_message
+    assert "Traceback" not in missing_module_message
+    assert "/sandbox/" not in missing_module_message
+
+    with pytest.raises(SandboxCodeError) as dynamic_key:
+        _run(tmp_path, 'raise KeyError(df["player"].iloc[0])')
+    dynamic_key_message = sandbox_code_error_message(dynamic_key.value)
+    assert "Alice" not in dynamic_key_message
+    assert "第 1 行" in dynamic_key_message
+
+    with pytest.raises(SandboxCodeError) as missing_static_key:
+        _run(tmp_path, 'value = df["score_phase"]')
+    missing_static_key_message = sandbox_code_error_message(missing_static_key.value)
+    assert "來源程式靜態引用鍵：score_phase" in missing_static_key_message
+    assert "第 1 行" in missing_static_key_message
     assert not list(tmp_path.iterdir())

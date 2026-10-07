@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -13,9 +16,173 @@ from scripts.evaluation_openwebui_client import (
     OpenWebUIClientError,
     OpenWebUIEvaluationClient,
     OpenWebUIStateUncertain,
+    _turn_result,
 )
 from scripts.evaluation_runner import EvaluationRunner
 from scripts.evaluation_workbench_service import _redact_secret_values
+
+
+@pytest.mark.parametrize(
+    "payload", [{"task_ids": ["native-task"]}, {}, {"task_ids": None}]
+)
+def test_manual_retry_rejects_active_or_unknown_native_task(payload: Any) -> None:
+    client = object.__new__(OpenWebUIEvaluationClient)
+    calls = []
+
+    def request(method: str, path: str) -> Any:
+        calls.append((method, path))
+        return payload
+
+    client._request_json = request
+    with pytest.raises(OpenWebUIStateUncertain):
+        client.assert_retry_idle("chat-1")
+    assert calls == [("GET", "/api/tasks/chat/chat-1")]
+
+
+def test_manual_retry_requires_confirmed_empty_native_task_list() -> None:
+    client = object.__new__(OpenWebUIEvaluationClient)
+    client._request_json = lambda method, path: {"task_ids": []}
+    client.assert_retry_idle("chat-1")
+
+    def unavailable(method: str, path: str) -> Any:
+        raise ConnectionError("離線")
+
+    client._request_json = unavailable
+    with pytest.raises(OpenWebUIStateUncertain, match="無法確認"):
+        client.assert_retry_idle("chat-1")
+
+
+def _run_isolated_adapter_import(
+    tmp_path: Path, mode: str
+) -> subprocess.CompletedProcess[str]:
+    project_root = Path(__file__).resolve().parents[1]
+    adapter_path = project_root / "scripts" / "evaluation_openwebui_client.py"
+    script = textwrap.dedent(
+        r"""
+        import importlib.util
+        import sys
+        import types
+        from pathlib import Path
+
+        project_root = Path(sys.argv[1]).resolve()
+        adapter_path = Path(sys.argv[2]).resolve()
+        mode = sys.argv[3]
+        kept_paths = []
+        for entry in sys.path:
+            resolved = Path(entry or ".").resolve()
+            try:
+                resolved.relative_to(project_root)
+            except ValueError:
+                kept_paths.append(entry)
+        sys.path[:] = kept_paths
+        assert importlib.util.find_spec("openwebui_patch") is None
+
+        scripts = types.ModuleType("scripts")
+        scripts.__path__ = []
+        runner = types.ModuleType("scripts.evaluation_runner")
+        runner.TurnResult = type("TurnResult", (), {})
+        sys.modules["scripts"] = scripts
+        sys.modules["scripts.evaluation_runner"] = runner
+
+        open_webui = types.ModuleType("open_webui")
+        open_webui.__path__ = []
+        sys.modules["open_webui"] = open_webui
+
+        if mode == "dependency-error":
+            class MissingRuntimeDependencyFinder:
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "open_webui.evaluation_observability":
+                        raise ModuleNotFoundError(
+                            "runtime helper dependency is missing",
+                            name="missing_runtime_dependency",
+                        )
+                    return None
+
+            sys.meta_path.insert(0, MissingRuntimeDependencyFinder())
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "scripts.evaluation_openwebui_client", adapter_path
+                )
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+            except ModuleNotFoundError as exc:
+                assert exc.name == "missing_runtime_dependency"
+            else:
+                raise AssertionError("helper 內部依賴錯誤不應被吞掉")
+            raise SystemExit(0)
+
+        contract = types.ModuleType("open_webui.evaluation_observability")
+        required = (
+            "decode_tool_payload",
+            "decode_tool_result_payload",
+            "decode_tool_error_payload",
+            "is_unexecuted_tool_output",
+        )
+        for name in required:
+            if mode != "old-helper" or name != "decode_tool_error_payload":
+                setattr(contract, name, lambda value=None, *_args, **_kwargs: value)
+        open_webui.evaluation_observability = contract
+        sys.modules[contract.__name__] = contract
+
+        spec = importlib.util.spec_from_file_location(
+            "scripts.evaluation_openwebui_client", adapter_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        if mode == "old-helper":
+            try:
+                spec.loader.exec_module(module)
+            except RuntimeError as exc:
+                message = str(exc)
+                assert "版本不相容" in message
+                assert "decode_tool_error_payload" in message
+            else:
+                raise AssertionError("舊版 helper 必須明確拒絕")
+            raise SystemExit(0)
+
+        spec.loader.exec_module(module)
+        assert module._tool_event_contract is contract
+        assert module._tool_event_contract.decode_tool_payload("native payload") == "native payload"
+        """
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script, str(project_root), str(adapter_path), mode],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_adapter_loads_installed_runtime_helper_without_repo_patch_path(
+    tmp_path: Path,
+) -> None:
+    result = _run_isolated_adapter_import(tmp_path, "runtime-helper")
+    assert result.returncode == 0, result.stderr
+
+
+def test_adapter_rejects_runtime_helper_missing_shared_contract_api(
+    tmp_path: Path,
+) -> None:
+    result = _run_isolated_adapter_import(tmp_path, "old-helper")
+    assert result.returncode == 0, result.stderr
+
+
+def test_adapter_does_not_hide_runtime_helper_dependency_error(tmp_path: Path) -> None:
+    result = _run_isolated_adapter_import(tmp_path, "dependency-error")
+    assert result.returncode == 0, result.stderr
+
+
+def test_adapter_uses_local_shared_contract_during_repository_development() -> None:
+    from scripts import evaluation_openwebui_client as adapter
+
+    assert (
+        adapter._tool_event_contract.__name__
+        == "openwebui_patch.evaluation_observability"
+    )
+    assert adapter._tool_event_contract.decode_tool_payload(
+        '{"analysis_runs_remaining":0}'
+    ) == {"analysis_runs_remaining": 0}
 
 
 class _Response:
@@ -188,7 +355,7 @@ class _MockOpenWebUI:
             chat_id = body["chat_id"]
             history = self.chats[chat_id]["chat"]["history"]
             user_message = dict(body["user_message"])
-            assistant_id = body["assistant_message_id"]
+            assistant_id = body["id"]
             user_message["childrenIds"] = [assistant_id]
             history["messages"][user_message["id"]] = user_message
             assistant = {
@@ -268,8 +435,11 @@ def test_turns_use_same_chat_and_actual_assistant_chart_tool_and_usage() -> None
 
     first_body, second_body = mock.completion_requests
     assert first_body["parent_id"] is None
-    assert second_body["parent_id"] == first_body["assistant_message_id"]
+    assert second_body["parent_id"] == first_body["id"]
     assert second_body["chat_id"] == chat_id
+    assert "assistant_message_id" not in first_body
+    assert first_body["badmintonai_evaluation"] is True
+    assert first_body["badmintonai_operation_id"] == "operation-one"
     assert second_body["messages"] == [{"role": "user", "content": "使用者補答"}]
     assert first_body["model"] == second_body["model"] == "badmintonai"
     assert first_body["tool_ids"] == second_body["tool_ids"] == ["server:badminton-ai"]
@@ -279,6 +449,24 @@ def test_turns_use_same_chat_and_actual_assistant_chart_tool_and_usage() -> None
         request.get_header("Authorization") == "Bearer secret-test-key"
         for request in mock.requests
     )
+
+
+def test_persisted_timeout_is_terminal_failure_without_resending_completion() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "",
+        "done": True,
+        "error": {"content": "模型服務等待逾時；本輪已記錄失敗，不會自動重送。"},
+    }
+    client = _client(mock)
+    chat_id = _create_chat(client)
+
+    result = client.send_turn(chat_id, "一題長分析", "timeout-operation")
+
+    assert result.error is not None
+    assert result.error["retryable"] is False
+    assert "逾時" in result.error["message"]
+    assert len(mock.completion_requests) == 1
 
 
 def test_conversation_export_keeps_q4_multi_turn_active_branch_order(
@@ -910,6 +1098,37 @@ def test_answer_with_analysis_and_optional_followup_is_not_waiting() -> None:
     assert result.clarification_signal == "none"
 
 
+def test_stdout_only_probe_is_not_reported_as_failed_analysis() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "欄位型別已確認，接下來才會保存正式統計。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "probe-only",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "probe-only",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"result_id":null,"artifacts":[],"stdout_preview":"landing_area 是 object"}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "先探查欄位", "stdout-probe")
+
+    assert result.error is None
+
+
 def test_failed_analysis_is_not_mislabeled_as_completed() -> None:
     mock = _MockOpenWebUI()
     mock.next_assistant = {
@@ -939,6 +1158,814 @@ def test_failed_analysis_is_not_mislabeled_as_completed() -> None:
         "message": "Python 分析工具未成功完成；回答需要人工複核",
         "retryable": False,
     }
+
+
+def test_stdout_probe_after_value_error_does_not_clear_analysis_failure() -> None:
+    mock = _MockOpenWebUI()
+    answer = "反手後對手下一拍直接終局得分：179／1,028（17.4%）。"
+    mock.next_assistant = {
+        "content": answer,
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-value-error",
+                "name": "runPythonAnalysis",
+                "status": "failed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-value-error",
+                "status": "failed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {"error": "ValueError while converting ball_round"}
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "stdout-probe-after-error",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "stdout-probe-after-error",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": None,
+                                "artifacts": [],
+                                "stdout_preview": answer,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "分析反手後得分", "q55-probe")
+
+    assert result.error == {
+        "message": "Python 分析工具未成功完成；回答需要人工複核",
+        "retryable": False,
+    }
+    assert result.messages[-1]["content"] == answer
+
+
+def test_formal_analysis_requires_saved_file_manifest() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "已完成分析。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-with-empty-manifest",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-with-empty-manifest",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps({"result_id": "a" * 48, "artifacts": []}),
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "請保存分析", "empty-manifest")
+
+    assert result.error == {
+        "message": "Python 分析工具未成功完成；回答需要人工複核",
+        "retryable": False,
+    }
+
+
+def test_probe_success_does_not_hide_terminal_analysis_error_when_chart_exists() -> (
+    None
+):
+    mock = _MockOpenWebUI()
+    retry_limit = {
+        "code": "analysis_retry_limit",
+        "details": {"terminal": True},
+    }
+    mock.next_assistant = {
+        "content": "已完成輸出。",
+        "done": True,
+        "embeds": ["<div>existing chart</div>"],
+        "output": [
+            {
+                "type": "function_call",
+                "id": "probe-1",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "probe-1",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": None,
+                                "artifacts": [],
+                                "stdout_preview": "欄位探查完成",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "analysis-terminal",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-terminal",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {"error": "HTTP error 429: " + json.dumps(retry_limit)}
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(
+        _create_chat(client), "請探查後分析", "probe-then-terminal"
+    )
+
+    assert result.error == {
+        "code": "analysis_retry_limit",
+        "message": "分析修正次數已達上限；本輪已停止，未完成部分不視為已驗證結論。",
+        "retryable": False,
+    }
+
+
+def test_analysis_message_limit_precedes_terminally_skipped_render_failure() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "已完成部分分析。",
+        "done": True,
+        "embeds": ["<div>existing chart</div>"],
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-12",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-12",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": "a" * 48,
+                                "result_fingerprint": "f" * 64,
+                                "analysis_runs_remaining": 0,
+                                "artifacts": [{"relative_path": "summary.json"}],
+                            }
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "analysis-over-budget",
+                "name": "runPythonAnalysis",
+                "status": "failed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-over-budget",
+                "status": "failed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "error": "HTTP error 429: "
+                                + json.dumps(
+                                    {
+                                        "code": "analysis_message_limit",
+                                        "details": {"terminal": True},
+                                    }
+                                )
+                            }
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "render-skipped",
+                "name": "renderAnalysisChart",
+                "status": "failed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-skipped",
+                "status": "failed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "本輪已因工具終止狀態停止；工具呼叫未執行。",
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(
+        _create_chat(client), "分析並畫圖", "analysis-cap-skipped-render"
+    )
+
+    assert result.error == {
+        "code": "analysis_message_limit",
+        "message": "分析執行次數已達上限；本輪已停止，未完成部分不視為已驗證結論。",
+        "retryable": False,
+    }
+    assert result.charts, "已發布圖表仍保留"
+    assert any("已完成部分分析。" in str(message) for message in result.messages)
+
+
+def test_budget_exhausted_fixed_failure_is_not_misclassified_as_completed() -> None:
+    mock = _MockOpenWebUI()
+    failure_text = (
+        "本則回答的分析執行次數已用完，且仍有未解錯誤或沒有可驗證的保存結果；"
+        "分析未完成，不提供未驗證數值。"
+    )
+    mock.next_assistant = {
+        "content": failure_text,
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "last-probe",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "last-probe",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": None,
+                                "artifacts": [],
+                                "stdout_preview": "僅探查，沒有正式產物",
+                                "analysis_runs_remaining": 0,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "id": "budget-failure-message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": failure_text}],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(
+        _create_chat(client), "請分析", "budget-probe-no-evidence"
+    )
+
+    assert result.error == {
+        "code": "analysis_message_limit",
+        "message": "分析執行次數已達上限，且沒有可驗證的完整結果；未完成部分不視為已驗證結論。",
+        "retryable": False,
+    }
+
+
+def test_executed_render_failure_still_wins_over_existing_chart() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "部分分析完成。",
+        "done": True,
+        "embeds": ["<div>existing chart</div>"],
+        "output": [
+            {
+                "type": "message",
+                "id": "budget-terminal",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "本則回答的分析執行次數已用完，且仍有未解錯誤或沒有可驗證的保存結果；"
+                            "分析未完成，不提供未驗證數值。"
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "analysis-limit",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-limit",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "code": "analysis_message_limit",
+                                "details": {"terminal": True},
+                            }
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "render-executed-fail",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-executed-fail",
+                "status": "completed",
+                "output": [
+                    {"type": "input_text", "text": '{"code":"render_code_error"}'}
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(
+        _create_chat(client), "分析並畫圖", "analysis-cap-real-render-failure"
+    )
+
+    assert result.error is not None
+    assert result.error.get("code") == "render_failed"
+
+
+def test_later_saved_analysis_result_recovers_from_prior_repairable_error() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "修正後已完成分析。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-failed",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-failed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"code":"analysis_code_error"}',
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "analysis-success",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-success",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": "a" * 48,
+                                "artifacts": [{"relative_path": "summary.json"}],
+                            }
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "請分析", "analysis-repaired")
+
+    assert result.error is None
+
+
+def test_failed_render_tool_is_not_mislabeled_as_completed() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "資料已整理，但互動圖沒有產生。",
+        "done": True,
+        "embeds": ["<div>earlier chart</div>"],
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-1",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            },
+            {
+                "type": "function_call",
+                "id": "render-1",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"code":"render_invalid_spec","message":"safe"}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "請分析並繪圖", "failed-render")
+
+    assert result.error == {
+        "code": "render_failed",
+        "message": "互動圖表未能完成發布；已停止自動修正，請查看原對話中的既有結果。",
+        "retryable": False,
+    }
+
+
+def test_render_only_failure_is_not_mislabeled_as_completed() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "前次分析已完成，但這次改圖失敗。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-only-1",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-only-1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"code":"render_invalid_spec","message":"safe"}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "改成熱圖", "render-only-failure")
+
+    assert result.error == {
+        "code": "render_failed",
+        "message": "互動圖表未能完成發布；已停止自動修正，請查看原對話中的既有結果。",
+        "retryable": False,
+    }
+
+
+def test_http_wrapped_render_failure_is_known_even_when_chat_has_a_chart() -> None:
+    mock = _MockOpenWebUI()
+    error_body = json.dumps(
+        {"code": "render_code_error", "message": "安全錯誤"},
+        ensure_ascii=False,
+    )
+    mock.next_assistant = {
+        "content": "已完成。",
+        "done": True,
+        "embeds": ["<div>existing chart</div>"],
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-http-1",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-http-1",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {"error": f"HTTP error 422: {error_body}"},
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "改成熱圖", "render-http-fail")
+
+    assert result.error == {
+        "code": "render_failed",
+        "message": "互動圖表未能完成發布；已停止自動修正，請查看原對話中的既有結果。",
+        "retryable": False,
+    }
+
+
+def test_render_only_success_is_not_mislabeled_as_missing_analysis() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "已依前次分析資料更新圖表。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-only-2",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-only-2",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"status":"embedded","result_id":"result-1","chart_count":1}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "改成熱圖", "render-only-success")
+
+    assert result.error is None
+
+
+def test_duplicate_suppressed_render_keeps_published_result_identity() -> None:
+    mock = _MockOpenWebUI()
+    result_id = "b" * 48
+    mock.next_assistant = {
+        "content": "圖表已在本則回答發布。",
+        "done": True,
+        "embeds": ["<div>published chart</div>"],
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-duplicate",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-duplicate",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "status": "duplicate_suppressed",
+                                "result_id": result_id,
+                                "chart_count": 1,
+                            }
+                        ),
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(
+        _create_chat(client), "確認剛發布的圖表", "duplicate-render"
+    )
+
+    assert result.error is None
+    assert len(result.charts) == 1
+    serialized_messages = json.dumps(result.messages, ensure_ascii=False)
+    assert "duplicate_suppressed" in serialized_messages
+    assert result_id in serialized_messages
+
+
+def test_repaired_render_failure_followed_by_success_is_completed() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "已修正圖表格式並完成附加。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-repair-1",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-repair-1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"code":"render_invalid_spec","message":"safe"}',
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "render-repair-2",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-repair-2",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"status":"embedded","result_id":"result-1","chart_count":1}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "修正後改成熱圖", "render-repaired")
+
+    assert result.error is None
+
+
+def test_unknown_render_state_is_not_cleared_by_later_success() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "圖表最後看似完成，但先前狀態無法確認。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-unknown-1",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-unknown-1",
+                "status": "completed",
+                "output": [{"type": "input_text", "text": "not-json"}],
+            },
+            {
+                "type": "function_call",
+                "id": "render-unknown-2",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-unknown-2",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"status":"embedded","result_id":"result-1","chart_count":1}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "改成熱圖", "render-unknown")
+
+    assert result.error == {
+        "message": "互動圖表工具結果未能確認；回答需要人工複核",
+        "retryable": False,
+    }
+    assert "code" not in result.error
+
+
+def test_terminal_render_failure_is_not_cleared_by_later_success() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "圖表狀態曾被標示為終止。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "render-terminal-1",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-terminal-1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"code":"chart_state_unknown","details":{"terminal":true}}',
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "render-terminal-2",
+                "name": "renderAnalysisChart",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "render-terminal-2",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": '{"status":"embedded","result_id":"result-1","chart_count":1}',
+                    }
+                ],
+            },
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "改成熱圖", "render-terminal")
+
+    assert result.error == {
+        "message": "互動圖表的發布狀態無法確認；請先查看原對話是否已有圖表，避免重複發布。",
+        "retryable": False,
+    }
+    assert "code" not in result.error
+
+
+def test_analysis_only_is_not_mislabeled_as_missing_chart() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "答案只需文字。",
+        "done": True,
+        "output": [
+            {
+                "type": "function_call",
+                "id": "analysis-1",
+                "name": "runPythonAnalysis",
+                "status": "completed",
+            }
+        ],
+    }
+
+    client = _client(mock)
+    result = client.send_turn(_create_chat(client), "請算平均值", "analysis-only")
+
+    assert result.error is None
 
 
 def test_unconfirmed_chart_without_saved_embed_requires_review() -> None:
@@ -1133,11 +2160,43 @@ def test_successful_retry_is_not_failed_by_earlier_analysis_error() -> None:
         "content": "重試後算出 31%。",
         "done": True,
         "output": [
-            {"type": "function_call", "name": "runPythonAnalysis", "status": "failed"},
             {
                 "type": "function_call",
+                "id": "analysis-failed",
+                "call_id": "analysis-failed",
+                "name": "runPythonAnalysis",
+                "status": "failed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-failed",
+                "status": "failed",
+                "output": [
+                    {"type": "input_text", "text": '{"code":"analysis_code_error"}'}
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "analysis-success",
+                "call_id": "analysis-success",
                 "name": "runPythonAnalysis",
                 "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "analysis-success",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": json.dumps(
+                            {
+                                "result_id": "a" * 48,
+                                "artifacts": [{"relative_path": "summary.json"}],
+                            }
+                        ),
+                    }
+                ],
             },
         ],
     }
@@ -1149,7 +2208,7 @@ def test_successful_retry_is_not_failed_by_earlier_analysis_error() -> None:
     assert result.error is None
 
 
-def test_clarification_marker_after_analysis_requires_manual_review() -> None:
+def test_completed_clarification_after_analysis_waits_for_answer() -> None:
     mock = _MockOpenWebUI()
     mock.next_assistant = {
         "content": "請先確認門檻。",
@@ -1164,21 +2223,18 @@ def test_clarification_marker_after_analysis_requires_manual_review() -> None:
                 "type": "function_call",
                 "name": "requestClarification",
                 "status": "completed",
+                "arguments": '{"question":"請先確認門檻？"}',
             },
         ],
     }
     result = _client(mock).send_turn(_create_chat(_client(mock)), "請分析", "conflict")
 
-    assert result.awaiting_clarification is False
-    assert result.clarification_signal == "event_conflict"
-    assert "需人工複核" in (result.clarification_review_reason or "")
-    assert result.error == {
-        "message": "本輪同時要求澄清並嘗試分析；需人工複核",
-        "retryable": False,
-    }
+    assert result.awaiting_clarification is True
+    assert result.clarification_signal == "event"
+    assert result.error is None
 
 
-def test_failed_analysis_before_clarification_also_requires_review() -> None:
+def test_failed_analysis_before_clarification_preserves_error_while_waiting() -> None:
     mock = _MockOpenWebUI()
     mock.next_assistant = {
         "content": "請先確認角落定義。",
@@ -1198,12 +2254,37 @@ def test_failed_analysis_before_clarification_also_requires_review() -> None:
         _create_chat(_client(mock)), "分析角落轉換", "failed-analysis-clarification"
     )
 
-    assert result.clarification_signal == "event_conflict"
-    assert result.awaiting_clarification is False
+    assert result.clarification_signal == "event"
+    assert result.awaiting_clarification is True
     assert result.error == {
-        "message": "本輪同時要求澄清並嘗試分析；需人工複核",
+        "message": "Python 分析工具未成功完成；回答需要人工複核",
         "retryable": False,
     }
+
+
+def test_completed_clarification_after_chart_still_waits_for_answer() -> None:
+    mock = _MockOpenWebUI()
+    mock.next_assistant = {
+        "content": "圖表已產生，先確認比較範圍。",
+        "done": True,
+        "embeds": ["<div>chart</div>"],
+        "output": [
+            {
+                "type": "function_call",
+                "name": "requestClarification",
+                "status": "completed",
+                "arguments": '{"question":"要比較哪幾場？"}',
+            }
+        ],
+    }
+
+    result = _client(mock).send_turn(
+        _create_chat(_client(mock)), "比較表現", "chart-first"
+    )
+
+    assert result.charts
+    assert result.clarification_signal == "event"
+    assert result.awaiting_clarification is True
 
 
 def test_usage_is_read_from_actual_assistant_info_without_estimation() -> None:
@@ -1465,3 +2546,63 @@ def test_client_does_not_read_dotenv_or_environment_for_credentials(
             api_key="",
             model_id="badmintonai",
         )
+
+
+def test_persisted_stream_failure_is_terminal_and_keeps_partial_answer() -> None:
+    response = {
+        "chat": {
+            "history": {
+                "messages": {
+                    "user-1": {"id": "user-1", "role": "user", "content": "題目"},
+                    "assistant-1": {
+                        "id": "assistant-1",
+                        "role": "assistant",
+                        "done": True,
+                        "content": "已輸出的部分文字",
+                        "error": {
+                            "content": {
+                                "code": "badmintonai_stream_no_progress_timeout",
+                                "message": "模型服務串流未持續產生回答或工具參數；本輪已停止。",
+                            }
+                        },
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "id": "call-1",
+                                "call_id": "call-1",
+                                "name": "runPythonAnalysis",
+                                "status": "failed",
+                            },
+                            {
+                                "type": "function_call_output",
+                                "id": "output-1",
+                                "call_id": "call-1",
+                                "status": "failed",
+                                "evaluation_event": {
+                                    "type": "tool_not_executed",
+                                    "reason": "stream_failure",
+                                },
+                                "output": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "模型服務串流未持續產生回答或工具參數；本輪已停止，未完成部分不視為已驗證。",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                }
+            }
+        }
+    }
+
+    result = _turn_result(response, "user-1", "assistant-1", lambda _message: False)
+
+    assert result is not None
+    assert result.error == {
+        "code": "badmintonai_stream_no_progress_timeout",
+        "message": "模型服務串流未持續產生回答或工具參數；回合已停止，未完成部分不視為已驗證。",
+        "retryable": False,
+    }
+    assert result.messages[-1]["content"] == "已輸出的部分文字"
+    assert result.tool_calls[0]["status"] == "failed"

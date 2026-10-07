@@ -47,6 +47,15 @@ async def _fake_get_admin_user(request: Request) -> dict[str, str]:
     raise HTTPException(status_code=401, detail="Not authenticated")
 
 
+async def _fake_get_current_user(request: Request) -> dict[str, str]:
+    authorization = request.headers.get("authorization")
+    if authorization == "Bearer test-admin":
+        return {"id": "admin-42", "username": "test-admin", "role": "admin"}
+    if authorization == "Bearer test-user":
+        return {"id": "user-17", "username": "test-user", "role": "user"}
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
+
 class _IdleClient:
     def get_model_snapshot(self) -> dict[str, Any]:
         return {"model_id": "badmintonai", "tool_ids": [], "updated_at": None}
@@ -60,6 +69,7 @@ def event_module(monkeypatch: pytest.MonkeyPatch) -> tuple[ModuleType, Any]:
     utils.__path__ = []  # type: ignore[attr-defined]
     auth = ModuleType("open_webui.utils.auth")
     auth.get_admin_user = _fake_get_admin_user  # type: ignore[attr-defined]
+    auth.get_current_user = _fake_get_current_user  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "open_webui", open_webui)
     monkeypatch.setitem(sys.modules, "open_webui.utils", utils)
     monkeypatch.setitem(sys.modules, "open_webui.utils.auth", auth)
@@ -110,6 +120,16 @@ def _register_on_startup(module: ModuleType, app: FastAPI) -> Any:
         )
     )
     return event_function
+
+
+def test_workbench_uses_shared_open_webui_favicon(
+    event_module: tuple[ModuleType, Any],
+) -> None:
+    module, _admin_dependency = event_module
+
+    assert '<link rel="icon" type="image/png" href="/static/favicon.png">' in (
+        module._PAGE_HTML
+    )
 
 
 def _app_with_spa_mount(static_dir: Path) -> FastAPI:
@@ -197,7 +217,7 @@ def test_lifecycle_registration_is_ordered_idempotent_and_restartable(
     assert restarted_names.index(module._PAGE_ROUTE_NAME) < restarted_names.index("spa")
 
 
-def test_page_assets_and_every_api_route_use_real_admin_dependency(
+def test_page_assets_and_routes_use_expected_auth_dependencies(
     event_module: tuple[ModuleType, Any],
     monkeypatch: pytest.MonkeyPatch,
     workbench: EvaluationWorkbenchService,
@@ -211,8 +231,17 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
     routes = _routes_by_name(app, module)
     assert set(routes) == module._OWN_ROUTE_NAMES
     for route in routes.values():
+        expected_dependency = (
+            module.get_current_user
+            if route.name
+            in {
+                "badmintonai_chat_export_html",
+                "badmintonai_chat_export_pdf",
+            }
+            else admin_dependency
+        )
         assert any(
-            dependency.call is admin_dependency
+            dependency.call is expected_dependency
             for dependency in route.dependant.dependencies
         )
 
@@ -221,13 +250,16 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
             if "GET" not in route.methods:
                 continue
             path = route.path.replace("{run_id}", "a" * 32)
+            path = path.replace("{chat_id}", "test-chat")
             assert client.get(path).status_code == 401
-            assert (
-                client.get(
-                    path, headers={"Authorization": "Bearer test-user"}
-                ).status_code
-                == 403
-            )
+            authorized = client.get(path, headers={"Authorization": "Bearer test-user"})
+            if route.name in {
+                "badmintonai_chat_export_html",
+                "badmintonai_chat_export_pdf",
+            }:
+                assert authorized.status_code in {404, 503}
+            else:
+                assert authorized.status_code == 403
 
         page = client.get(PAGE_PATH, headers={"Authorization": "Bearer test-admin"})
         new_page = client.get(
@@ -275,6 +307,7 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
         == 200
     )
     assert '<html lang="zh-Hant">' in page.text
+    assert '<link rel="icon" type="image/png" href="/static/favicon.png">' in page.text
     assert 'href="#main-content"' in page.text
     assert '<main class="workbench" id="main-content">' in page.text
     assert '<p class="eyebrow">' not in page.text
@@ -290,13 +323,13 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
     assert 'id="page-lede"' in page.text
     assert f'href="{NEW_PAGE_PATH}"' in page.text
     assert f'href="{HISTORY_PAGE_PATH}"' in page.text
-    assert 'id="historical-run-detail"' in page.text
+    assert 'id="selected-run-notice" class="help" hidden' in page.text
     assert 'id="selected-count"' in page.text
     assert 'id="select-all-button"' in page.text
     assert 'id="clear-selection-button"' in page.text
     assert 'id="range-input"' in page.text
     assert 'id="question-matrix"' in page.text
-    assert 'id="historical-question-matrix"' in page.text
+    assert 'id="historical-question-matrix"' not in page.text
     assert 'id="question-detail-dialog"' in page.text
     assert 'aria-modal="true"' in page.text
     assert 'aria-labelledby="question-detail-title"' in page.text
@@ -304,7 +337,7 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
     assert all(
         f'class="state-swatch state-{status}"' in page.text
         for status in (
-            "pending",
+            "queued",
             "running",
             "awaiting_clarification",
             "needs_review",
@@ -312,7 +345,7 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
             "failed",
         )
     )
-    assert "凍結 checkpoint 的原始狀態與回合不會被改寫" in page.text
+    assert "註記另存，不改寫凍結 checkpoint" in page.text
     assert "server-only-test-secret" not in page.text
     assert "server-only-test-secret" not in js.text
     assert "innerHTML" not in js.text
@@ -325,38 +358,53 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
         "function openQuestionDetails(question, runId, showAnnotationTools, sourceElement)"
         in js.text
     )
-    assert "function renderClarificationForm(question)" in js.text
+    assert "function renderClarificationForm(question, runId)" in js.text
     assert "const questionStatuses = [" in js.text
+    assert 'queued: "排隊中"' in js.text
+    assert 'awaiting_clarification: "待補答"' in js.text
+    assert 'completed: "已完成"' in js.text
     assert '["總題數", String(questions.length)]' in js.text
+    assert (
+        '["已排隊補答", `${Number.isInteger(run.queued_clarification_count)' in js.text
+    )
     assert '["總處理耗時（不含等待補答）", elapsedSummary]' in js.text
     assert ".map((question) => processingElapsedMs(question))" in js.text
     assert "question.elapsed_ms - question.user_wait_ms" in js.text
     assert "const counts = Object.fromEntries(questionStatuses.map(" in js.text
-    assert 'needs_review: "需要人工複核"' in js.text
+    assert 'needs_review: "需複核"' in js.text
     assert "classification-annotation" in js.text
     assert "人工分類註記已另存；原始 checkpoint 未改寫" in js.text
+    assert "function statusPath(useSelectedRun = true)" in js.text
+    assert "const selectedRunId = requestedRunId || null" in js.text
     assert (
-        "renderQuestionMatrix(historicalQuestionMatrix, payload.run.questions, payload.run_id, true)"
+        "reviewLink.href = `/badmintonai/evaluation?run_id=${encodeURIComponent(run.run_id)}`"
         in js.text
     )
     assert 'button.setAttribute("aria-haspopup", "dialog")' in js.text
     assert 'button.setAttribute("aria-controls", "question-detail-dialog")' in js.text
     assert "detailDialog.showModal()" in js.text
+    assert 'detailDialog.addEventListener("click"' in js.text
+    assert "if (outside) detailDialog.close();" in js.text
     assert 'detailDialog.addEventListener("close"' in js.text
     assert "function clearConversationPreview()" in js.text
     assert "async function loadConversationPreview(" in js.text
     assert 'credentials: "same-origin"' in js.text
     assert 'cache: "no-store"' in js.text
-    assert "conversation.append(prompt, answer)" in js.text
+    assert "conversation.append(answer)" in js.text
     assert "clearConversationPreview();" in js.text
     assert 'frame.setAttribute("sandbox", "allow-scripts")' in js.text
     assert 'frame.setAttribute("referrerpolicy", "no-referrer")' in js.text
     assert 'detailConversationFrame.removeAttribute("src")' in js.text
     assert 'frame.setAttribute("loading", "eager")' in js.text
+    assert "let navigationRequested = false" in js.text
+    assert (
+        'help.textContent = "原對話已載入；完整 Markdown 與互動圖表顯示於下方。"'
+        in js.text
+    )
     assert "`${conversationPath}#chart-0`" in js.text
     assert "展開完整對話與互動圖表" not in js.text
     assert "完整 Markdown 與互動圖表會顯示於下方" in js.text
-    assert "原對話目前無法讀取；以下提供安全的題目與回答備援。" in js.text
+    assert "原題保留於上方，以下提供安全回答備援。" in js.text
     assert (
         "questions/${encodeURIComponent(String(question.id))}/conversation.html"
         in js.text
@@ -368,8 +416,9 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
     assert 'appendDetailValue(metrics, "人工等待補答"' not in js.text
     assert 'appendDetailValue(metrics, "端到端耗時（含等待）"' not in js.text
     assert 'appendDetailValue(metrics, "處理耗時（不含人工等待）"' in js.text
-    assert "item.append(head, conversation, metrics)" in js.text
-    assert "item.append(head, prompt, answer, metrics, conversation)" in js.text
+    assert "item.append(head, prompt);" in js.text
+    assert "item.append(conversation);" in js.text
+    assert "question.clarification_projection_note" in js.text
     assert 'stopping: "停止中"' in js.text
     assert '"X-Selected-Question-Ids": JSON.stringify(questionIds)' in js.text
     assert "question_ids: questionIds" in js.text
@@ -380,15 +429,17 @@ def test_page_assets_and_every_api_route_use_real_admin_dependency(
         in js.text
     )
     assert '"下載離線 HTML 報告", "report.html", false' in js.text
+    assert '"下載 PDF 報告", "report.pdf", false' in js.text
     assert '"列印／另存 PDF", "report/print", true' in js.text
     assert "`${apiBase}/runs/${run.run_id}/report.html`" in js.text
     assert "`${apiBase}/runs/${run.run_id}/report/print`" in js.text
-    assert "工作台不提供直接 PDF API" in js.text
+    assert "可直接下載 PDF" in js.text
     assert "@media (prefers-color-scheme: dark)" in css.text
     assert ".question-matrix > .empty { grid-column: 1 / -1; }" in css.text
     assert ".question-tile:focus-visible" in css.text
     assert ".question-detail-dialog::backdrop" in css.text
     assert ".conversation-frame" in css.text
+    assert ".conversation-frame[hidden] { display: none; }" in css.text
     assert ".conversation-link:focus-visible" in css.text
     assert "embed" not in js.text.casefold()
     assert "server-only-test-secret" not in status.text
@@ -477,7 +528,7 @@ def test_new_page_selection_posts_only_selected_ids_for_builtin_and_upload(
     assert output["activePage"] == "new"
     assert output["builtinQuestionIds"] == ["4", "10"]
     assert output["uploadQuestionIds"] == ["1", "4", "10"]
-    assert output["conversationQuestionIds"] == ["3", "4"]
+    assert output["conversationQuestionIds"] == ["3", "3", "4"]
 
 
 def test_post_route_requires_same_origin_after_admin_authentication(

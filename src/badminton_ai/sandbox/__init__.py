@@ -11,6 +11,7 @@ from .service import (
     SandboxCodeError,
     SandboxError,
     SandboxExecutionError,
+    SandboxInputFile,
     SandboxJob,
     SandboxMaterializationError,
     SandboxOutputError,
@@ -20,6 +21,7 @@ from .service import (
     SandboxTimeoutError,
     SandboxUnavailableError,
     SnapshotMaterializer,
+    sandbox_code_error_message,
 )
 
 __all__ = [
@@ -33,6 +35,7 @@ __all__ = [
     "SandboxCodeError",
     "SandboxError",
     "SandboxExecutionError",
+    "SandboxInputFile",
     "SandboxJob",
     "SandboxMaterializationError",
     "SandboxOutputError",
@@ -42,4 +45,5 @@ __all__ = [
     "SandboxTimeoutError",
     "SandboxUnavailableError",
     "SnapshotMaterializer",
+    "sandbox_code_error_message",
 ]

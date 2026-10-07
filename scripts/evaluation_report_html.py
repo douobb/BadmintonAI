@@ -25,6 +25,12 @@ from badminton_ai.server.plotly_rich import (  # noqa: E402
     PLOTLY_ASSET_PATH,
     PLOTLY_JS_VERSION,
 )
+from scripts.evaluation_runner import manual_retry_succeeded  # noqa: E402
+from scripts.evaluation_usage import (  # noqa: E402
+    format_usage_summary,
+    summarize_question,
+    summarize_questions,
+)
 from scripts.export_chat_html import (  # noqa: E402
     ChatExportError,
     parse_embedded_plotly_charts,
@@ -304,11 +310,6 @@ def build_evaluation_report_html(
     embed_warnings = 0
     chart_payload_bytes = 0
     status_counts: dict[str, int] = {}
-    usage_values: dict[str, list[int | None]] = {
-        "input_tokens": [],
-        "output_tokens": [],
-        "total_tokens": [],
-    }
 
     for question_index, question in enumerate(questions, start=1):
         if not isinstance(question, dict):
@@ -316,14 +317,6 @@ def build_evaluation_report_html(
         question_id = _text(question.get("id")) or str(question_index)
         status = _text(question.get("status")) or "未知"
         status_counts[status] = status_counts.get(status, 0) + 1
-        usage_totals = question.get("usage_totals")
-        for key, values in usage_values.items():
-            value = usage_totals.get(key) if isinstance(usage_totals, dict) else None
-            values.append(
-                value
-                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
-                else None
-            )
         turns = question.get("turns")
         if not isinstance(turns, list):
             turns = []
@@ -493,7 +486,11 @@ def build_evaluation_report_html(
             '<article class="question"><header><h2>題目 '
             + html.escape(question_id)
             + '</h2><span class="status">'
-            + html.escape(_STATUS_LABELS.get(status, status))
+            + html.escape(
+                "重試後成功"
+                if manual_retry_succeeded(question)
+                else _STATUS_LABELS.get(status, status)
+            )
             + '</span></header><dl class="stats">'
             + "<div><dt>端到端耗時</dt><dd>"
             + html.escape(_duration(question.get("elapsed_ms")))
@@ -501,8 +498,8 @@ def build_evaluation_report_html(
             + html.escape(_duration(question.get("processing_elapsed_ms")))
             + "</dd></div><div><dt>等待補答耗時</dt><dd>"
             + html.escape(_duration(question.get("user_wait_ms")))
-            + "</dd></div><div><dt>Token 合計（只記實際 usage）</dt><dd>"
-            + html.escape(_usage(question.get("usage_totals")))
+            + "</dd></div><div><dt>Token 用量與完整度</dt><dd>"
+            + html.escape(format_usage_summary(summarize_question(question)))
             + "</dd></div><div><dt>工具呼叫</dt><dd>"
             + str(question_tools)
             + "</dd></div><div><dt>圖表 metadata</dt><dd>"
@@ -545,22 +542,17 @@ def build_evaluation_report_html(
         ):
             raise EvaluationReportError("固定版 Plotly 資產驗證失敗")
 
-    run_usage = {
-        key: (
-            sum(values)
-            if values
-            and len(values) == len(questions)
-            and all(value is not None for value in values)
-            else None
-        )
-        for key, values in usage_values.items()
-    }
+    run_usage = summarize_questions(questions)
     run_snapshot = {
         "run_id": run_id,
         "created_at": state.get("created_at"),
         "updated_at": state.get("updated_at"),
         "status_counts": status_counts,
-        "usage_totals": run_usage,
+        "usage_totals": run_usage["token_totals"],
+        "token_observed_totals": run_usage["observed_totals"],
+        "token_coverage": run_usage["fields"],
+        "usage_attempt_count": run_usage["attempt_count"],
+        "token_summary": format_usage_summary(run_usage),
         "question_source": manifest.get("question_source"),
         "model_snapshot": manifest.get("model_snapshot"),
         "data_snapshot": manifest.get("data_snapshot"),
@@ -577,6 +569,7 @@ def build_evaluation_report_html(
         )
         or "未提供"
     )
+    status_summary += f"；重試後成功 {sum(manual_retry_succeeded(q) for q in questions if isinstance(q, dict))} 題"
     report_data = script_safe_json(chart_payload)
     library_block = f"<script>\n{plotly_js}\n</script>" if plotly_js else ""
     chart_data_block = (
@@ -627,6 +620,8 @@ def build_evaluation_report_html(
     }
     return update;
   };
+  const pdfState = window.__BADMINTON_PDF_RENDER__;
+  const statusNode = document.getElementById("report-render-status");
   const promises = [];
   for (const [index, chart] of chartData.entries()) {
     const target = document.getElementById("chart-" + index);
@@ -634,8 +629,9 @@ def build_evaluation_report_html(
     delete layout.title;
     layout.autosize = true;
     const axes = applyPalette(layout, chart.figure.data, palette());
-    const promise = window.Plotly.newPlot(target, chart.figure.data, layout,
-      {responsive: true, displaylogo: false, scrollZoom: false})
+    const promise = Promise.resolve()
+      .then(() => window.Plotly.newPlot(target, chart.figure.data, layout,
+        {responsive: true, displaylogo: false, scrollZoom: false}))
       .then(() => {
         rendered.push({target, axes});
         if (Array.isArray(chart.figure.frames) && chart.figure.frames.length) {
@@ -643,10 +639,25 @@ def build_evaluation_report_html(
         }
         return null;
       })
-      .catch(() => { target.textContent = "此圖表無法呈現。"; });
+      .catch(() => {
+        target.textContent = "此圖表無法呈現。";
+        throw new Error("chart-render-failed");
+      });
     promises.push(promise);
   }
-  window.evaluationReportChartsReady = Promise.all(promises);
+  window.evaluationReportChartsReady = Promise.all(promises).then(
+    () => {
+      pdfState.status = "ready";
+      statusNode.textContent = "報告內容已就緒。";
+      return true;
+    },
+    () => {
+      pdfState.status = "error";
+      pdfState.error = "chart-render-failed";
+      statusNode.textContent = "圖表無法完成繪製，因此不會產生不完整 PDF。請重新載入報告後再試。";
+      return false;
+    }
+  );
   const setTheme = theme => {
     document.documentElement.dataset.theme = theme;
     for (const {target, axes} of rendered) window.Plotly.relayout(target, paletteUpdate(axes));
@@ -665,7 +676,7 @@ def build_evaluation_report_html(
   });
   document.getElementById("report-theme").addEventListener("change", event => setTheme(event.currentTarget.value));
   document.getElementById("report-print").addEventListener("click", async () => {
-    await window.evaluationReportChartsReady;
+    if (!await window.evaluationReportChartsReady) return;
     const previousTheme = document.documentElement.dataset.theme;
     window.addEventListener("afterprint", () => setTheme(previousTheme), {once: true});
     setTheme("light");
@@ -679,6 +690,7 @@ def build_evaluation_report_html(
 <script>
 (function () {
   "use strict";
+  window.evaluationReportChartsReady = Promise.resolve(true);
   document.getElementById("report-theme").addEventListener("change", event => {
     document.documentElement.dataset.theme = event.currentTarget.value;
   });
@@ -752,11 +764,13 @@ dd {{ margin:0; overflow-wrap:anywhere; }}
 :root[data-theme="dark"] .warning {{ color:#fdba74; }}
 :root[data-theme="dark"] .error {{ color:#fca5a5; }}
 .muted,.turn-stats {{ color:var(--muted); font-size:.9rem; }}
+.render-status {{ margin:.6rem 0 1rem; color:var(--muted); }}
 @media print {{
-  @page {{ margin:14mm; }}
+  @page {{ size:A4; margin:14mm; }}
   :root,:root[data-theme="dark"] {{ color-scheme:light !important; --bg:#fff !important; --fg:#171717 !important; --muted:#444 !important; --panel:#f5f5f5 !important; --border:#aaa !important; background:#fff !important; color:#171717 !important; print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
   body {{ max-width:none; padding:0; background:#fff !important; color:#171717 !important; font-size:10pt; }}
   .toolbar {{ display:none !important; }}
+  .render-status {{ color:#444 !important; }}
   .skip-link {{ display:none !important; }}
   .report-meta,.question,.turn,.chart-card {{ background:#fff !important; color:#171717 !important; border-color:#aaa !important; box-shadow:none !important; }}
   .question {{ margin:0 0 8mm; padding:5mm; }}
@@ -784,7 +798,7 @@ dd {{ margin:0; overflow-wrap:anywhere; }}
 </head>
 <body>
 <a class="skip-link" href="#questions">跳至逐題紀錄</a>
-<header><p>BadmintonAI · Evaluation</p><h1>評測執行報告</h1><p>HTML 離線報告；PDF 請使用瀏覽器「列印／另存 PDF」，本系統不提供直接 PDF API。</p></header>
+<header><p>BadmintonAI · Evaluation</p><h1>評測執行報告</h1><p>可下載 PDF 或 HTML 離線報告；也可使用瀏覽器手動列印調整版面。</p><p id="report-render-status" class="render-status" role="status" aria-live="polite">{"圖表載入中…" if chart_payload else "報告內容已就緒。"}</p></header>
 <nav class="toolbar" aria-label="報告控制">
   <label for="report-theme">報告主題</label>
   <select id="report-theme"><option value="light">淺色</option><option value="dark">深色</option></select>
@@ -798,7 +812,7 @@ dd {{ margin:0; overflow-wrap:anywhere; }}
 <div><dt>更新時間</dt><dd>{html.escape(_text(state.get("updated_at")) or "未提供")}</dd></div>
 <div><dt>題數</dt><dd>{len(questions)}</dd></div>
 <div><dt>題目狀態</dt><dd>{html.escape(status_summary)}</dd></div>
-<div><dt>Token 合計（僅完整實測值）</dt><dd>{html.escape(_usage(run_usage))}</dd></div>
+<div><dt>Token 用量與完整度</dt><dd>{html.escape(format_usage_summary(run_usage))}</dd></div>
 <div><dt>工具呼叫</dt><dd>{total_tool_calls}</dd></div>
 <div><dt>圖表 metadata</dt><dd>{total_chart_metadata}</dd></div>
 <div><dt>安全呈現圖表</dt><dd>{len(chart_payload)}</dd></div>
@@ -811,6 +825,7 @@ dd {{ margin:0; overflow-wrap:anywhere; }}
 </section>
 <section id="questions" aria-label="逐題評測紀錄">{"".join(question_markup)}</section>
 </main>
+<script>window.__BADMINTON_PDF_RENDER__ = {{status: "{"pending" if chart_payload else "ready"}", error: null}};</script>
 {library_block}
 {chart_data_block}
 {renderer_block}

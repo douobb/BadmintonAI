@@ -13,8 +13,76 @@ from scripts.evaluation_runner import (
     EvaluationError,
     EvaluationRunner,
     TurnResult,
+    manual_retry_succeeded,
     parse_numbered_questions,
 )
+
+
+def test_manual_retry_preserves_failed_request_and_usage(tmp_path: Path) -> None:
+    failed = TurnResult(
+        error={"message": "失敗", "retryable": False},
+        usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+    )
+    success = TurnResult(
+        messages=[{"role": "assistant", "content": "完成"}],
+        usage={"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    )
+    client = FakeOpenWebUI(plans={"1": [failed, success]})
+    runner = _runner(client, tmp_path, questions="1: 原題\n", max_attempts=1)
+    runner.run_pending()
+    before = runner.snapshot()["questions"][0]
+    assert before["status"] == "failed"
+    after = runner.retry_failed("1")["questions"][0]
+    assert after["status"] == "completed"
+    assert manual_retry_succeeded(after)
+    assert after["turns"][0] == before["turns"][0]
+    assert client.sends[0][1] == client.sends[1][1] == "原題"
+    assert after["usage_totals"]["total_tokens"] == 9
+    summary = runner.summary()
+    assert summary["manual_retry_succeeded_count"] == 1
+    assert summary["token_observed_totals"] == {
+        "input_tokens": 6,
+        "output_tokens": 3,
+        "total_tokens": 9,
+    }
+    assert summary["token_coverage"]["total_tokens"]["complete"] is True
+    assert summary["questions"][0]["usage_attempt_count"] == 2
+    with pytest.raises(EvaluationError):
+        runner.retry_failed("1")
+
+
+def test_manual_retry_failure_never_automatically_resends(tmp_path: Path) -> None:
+    failed = TurnResult(error={"message": "失敗", "retryable": False})
+    again = TurnResult(error={"message": "仍失敗", "retryable": True})
+    client = FakeOpenWebUI(plans={"1": [failed, again]})
+    runner = _runner(client, tmp_path, questions="1: 原題\n", max_attempts=2)
+    runner.run_pending()
+    question = runner.retry_failed("1")["questions"][0]
+    assert question["status"] == "failed"
+    assert len(client.sends) == 2
+    assert question["manual_retry_count"] == 1
+    assert not manual_retry_succeeded(question)
+
+
+def test_manual_retry_unknown_native_task_is_not_resent(tmp_path: Path) -> None:
+    client = FakeOpenWebUI(plans={"1": [ValueError("失敗")]})
+    runner = _runner(client, tmp_path, questions="1: 原題\n", max_attempts=1)
+    runner.run_pending()
+    client.recover_errors.append(ConnectionError("仍在執行或狀態未知"))
+    with pytest.raises(EvaluationError, match="未知或仍執行"):
+        runner.retry_failed("1")
+    assert len(client.sends) == 1
+    assert runner.snapshot()["questions"][0]["status"] == "failed"
+
+
+def test_manual_retry_projection_ignores_clarification_and_legacy_retry() -> None:
+    for turn in (
+        {"kind": "clarification", "result": {}},
+        {"kind": "clarification", "manual_retry": True, "result": {}},
+        {"kind": "retry", "result": {}},
+        {"manual_retry": True, "result": {"awaiting_clarification": True}},
+    ):
+        assert not manual_retry_succeeded({"status": "completed", "turns": [turn]})
 
 
 class SimulatedProcessCrash(BaseException):
@@ -539,6 +607,45 @@ def test_clarification_pauses_only_one_question_and_reuses_its_chat(
     assert question_one["turns"][1]["request"] == "第一場比賽"
     assert client.sends[-1][0] == original_chat_id
     assert len(client.creates) == 2
+
+
+def test_valid_clarification_waits_without_hiding_same_turn_analysis_error(
+    tmp_path: Path,
+) -> None:
+    clarification_event = {
+        "type": "function_call",
+        "name": "requestClarification",
+        "status": "completed",
+        "arguments": json.dumps({"question": "採用哪個比賽範圍？"}),
+    }
+    error = {
+        "message": "Python 分析工具未成功完成；回答需要人工複核",
+        "retryable": False,
+    }
+    result = TurnResult(
+        messages=[
+            {
+                "role": "assistant",
+                "content": "請先確認比賽範圍。",
+                "output": [clarification_event],
+            }
+        ],
+        tool_calls=[
+            {"name": "runPythonAnalysis", "status": "failed"},
+            clarification_event,
+        ],
+        awaiting_clarification=True,
+        clarification_signal="event",
+        error=error,
+    )
+    client = FakeOpenWebUI({"1": [result]})
+    runner = _runner(client, tmp_path)
+
+    state = runner.run_pending()
+    question = state["questions"][0]
+
+    assert question["status"] == "awaiting_clarification"
+    assert question["turns"][0]["result"]["error"] == error
 
 
 def test_start_refuses_to_mix_different_question_or_snapshot_versions(
