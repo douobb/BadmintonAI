@@ -25,7 +25,7 @@ from ..query import MAX_PAGE_LIMIT, BadmintonQueryService
 
 DEFAULT_SANDBOX_IMAGE = (
     "ghcr.io/douobb/badminton-ai-sandbox@sha256:"
-    "ee9862501ceac5bf9064679b209ccb88801df753dc16fc14ecef76c386b9cc22"
+    "78c162aa9c4952347c9d7fc0fb1a948649fdb9d2c7c176085c92cfc3fe2cf678"
 )
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MEMORY_BYTES = 512 * 1024 * 1024

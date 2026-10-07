@@ -86,10 +86,12 @@ finally {
 ## 3. 拉取固定版本的分析沙箱
 
 ```powershell
-docker pull ghcr.io/douobb/badminton-ai-sandbox@sha256:ee9862501ceac5bf9064679b209ccb88801df753dc16fc14ecef76c386b9cc22
+docker pull ghcr.io/douobb/badminton-ai-sandbox@sha256:78c162aa9c4952347c9d7fc0fb1a948649fdb9d2c7c176085c92cfc3fe2cf678
 ```
 
-這是公開 GHCR 映像，不需要登入。程式以 digest 固定版本，避免不同安裝取得不一致的沙箱。映像目前以 `linux/amd64` 建置及驗證。
+這是公開 GHCR 映像，不需要登入。此 digest 對應 `20261007` 版本，已包含 Python 分析、獨立繪圖與錯誤診斷功能；一般安裝不需自行建置沙箱。程式以 digest 固定版本，避免不同安裝取得不一致的沙箱。映像目前以 `linux/amd64` 建置及驗證。
+
+`.env` 的 `BADMINTON_AI_SANDBOX_IMAGE` 留空即可使用上述預設。若舊安裝已設定本機映像 override，更新程式不會自動覆蓋它；要改用公開版時，先拉取上述映像，再清空此設定並重建 Tool Server。
 
 Compose 只建置 Tool Server 與修補版 Open WebUI；Python 分析時，Tool Server 會要求本機 Docker 使用這個預先拉取的映像建立短生命週期容器。若跳過此步驟，聊天頁仍可能開啟，但 Python 分析會因找不到映像而失敗。
 
@@ -120,14 +122,14 @@ Invoke-RestMethod http://localhost:8000/health
    等待文件處理完成。`knowledge/court-zones.json` 是程式使用的機器可讀檔，不是一般聊天知識文件的必要上傳項目。
 5. **建立 BadmintonAI 模型**：到 Workspace > Models 建立模型，名稱可用 `BadmintonAI`，模型 ID 必須是 `badmintonai`（評測工作台使用此 ID）。選擇剛設定的基礎模型，將 `prompts/badmintonai-system.md` 的內容貼入系統提示詞，並綁定剛建立的 Skill、Knowledge，以及 Tool Server 提供的必要工具。基礎模型須支援可靠的工具呼叫，否則模型可能不會正確使用資料分析工具。
 
-獨立繪圖工具需要新版 sandbox bootstrap。公開 pinned GHCR digest 尚未包含此版本；啟用 renderer 前，請在專案根目錄建置本機固定 tag，並在私有 `.env` 設定 `BADMINTON_AI_SANDBOX_IMAGE=badmintonai-sandbox:analysis-render-20261003`：
+只有修改沙箱程式或測試自訂版本時，才需自行建置。在專案根目錄執行以下命令，並在私有 `.env` 設定 `BADMINTON_AI_SANDBOX_IMAGE=badmintonai-sandbox:local`：
 
 ```powershell
-docker build -f sandbox/Dockerfile -t badmintonai-sandbox:analysis-render-20261003 .
+docker build --platform linux/amd64 -f sandbox/Dockerfile -t badmintonai-sandbox:local .
 docker compose up -d tool-server
 ```
 
-這項本機 override 只影響 Compose 啟動的 Tool Server，不會發布 GHCR image；公開 digest 需另行建置、驗證與發布。
+這項本機 override 只影響 Compose 啟動的 Tool Server，不會發布 GHCR image；一般使用者可跳過此建置步驟。
 
 Open WebUI 的操作名稱會隨版本略有不同；可參考官方文件：[Models](https://docs.openwebui.com/features/workspace/models/)、[Skills](https://docs.openwebui.com/features/workspace/skills/)、[Knowledge](https://docs.openwebui.com/features/workspace/knowledge/) 與 [OpenAPI Servers](https://docs.openwebui.com/features/extensibility/plugin/tools/openapi-servers/)。
 

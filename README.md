@@ -12,7 +12,7 @@ BadmintonAI 讓使用者用自然語言分析羽球逐拍資料。Open WebUI 提
 
 ## 開始使用
 
-需要 Git 與 Docker Desktop（含 Docker Compose）。專案已附羽球逐拍 CSV、欄位 metadata、100 題題庫及 Skill／Knowledge 原始文件；Compose 會建置 Tool Server 與修補版 Open WebUI，分析沙箱映像則從 GHCR 公開下載。
+需要 Git 與 Docker Desktop（含 Docker Compose）。專案已附羽球逐拍 CSV、欄位 metadata、100 題題庫及 Skill／Knowledge 原始文件；Compose 會建置 Tool Server 與修補版 Open WebUI，分析沙箱映像則從 GHCR 公開下載，已包含分析與獨立繪圖功能，不需另行建置。
 
 第一次安裝還需建立本機秘密檔，並在 Open WebUI 手動設定模型供應商、Tool Server、system prompt、Skill 與 Knowledge。請依照[首次設定指南](docs/first-setup.md)逐步完成。
 
